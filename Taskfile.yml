@@ -1,0 +1,94 @@
+version: '3'
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task: list
+
+  list:
+    desc: Show available tasks
+    silent: true
+    cmds:
+      - task --list
+
+  build:
+    desc: Build debug binary
+    cmds:
+      - cargo build
+
+  build:release:
+    desc: Build release binary
+    cmds:
+      - cargo build --release
+
+  test:
+    desc: Run tests
+    cmds:
+      - cargo test
+
+  test:watch:
+    desc: Watch tests
+    cmds:
+      - |
+        if command -v cargo-watch >/dev/null 2>&1; then
+          cargo watch -x test
+        else
+          echo "cargo-watch not installed; running cargo test once"
+          cargo test
+        fi
+
+  lint:
+    desc: Run clippy
+    cmds:
+      - cargo clippy --all-targets -- -D warnings
+
+  fmt:
+    desc: Format Rust
+    cmds:
+      - cargo fmt --all
+
+  fmt:check:
+    desc: Check Rust formatting
+    cmds:
+      - cargo fmt --all -- --check
+
+  run:
+    desc: Run asm; pass args after --
+    cmds:
+      - cargo run -- {{.CLI_ARGS}}
+
+  run:release:
+    desc: Run release asm; pass args after --
+    cmds:
+      - cargo run --release -- {{.CLI_ARGS}}
+
+  reindex:
+    desc: Rebuild asm index
+    cmds:
+      - cargo run --release -- reindex
+
+  install:
+    desc: Install asm on PATH
+    cmds:
+      - cargo install --path .
+
+  uninstall:
+    desc: Remove asm from PATH
+    cmds:
+      - cargo uninstall asm
+
+  shell:install:
+    desc: Install zsh hook
+    cmds:
+      - cargo run --release -- install
+
+  shell:uninstall:
+    desc: Uninstall zsh hook
+    cmds:
+      - cargo run --release -- uninstall
+
+  clean:
+    desc: Clean build outputs
+    cmds:
+      - cargo clean
