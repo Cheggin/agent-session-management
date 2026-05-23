@@ -304,9 +304,8 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value
         let span = info_span!("asm.db.list_all");
         let _enter = span.enter();
         let started = Instant::now();
-        let result = (|| {
-            self.query_sessions(
-                r#"
+        let result = self.query_sessions(
+            r#"
 SELECT
   id,
   agent,
@@ -325,9 +324,8 @@ SELECT
 FROM sessions
 ORDER BY last_user_msg_at DESC, started_at DESC, id ASC
 "#,
-                &[],
-            )
-        })();
+            &[],
+        );
         info!(
             elapsed_ms = elapsed_ms(started),
             ok = result.is_ok(),
@@ -340,7 +338,7 @@ ORDER BY last_user_msg_at DESC, started_at DESC, id ASC
         let span = info_span!("asm.db.list_filtered");
         let _enter = span.enter();
         let started = Instant::now();
-        let result = (|| {
+        let result = {
             let mut sql = String::from(
                 r#"
 SELECT
@@ -392,7 +390,7 @@ WHERE is_sidechain = 0
 
             sql.push_str("ORDER BY last_user_msg_at DESC");
             self.query_sessions(&sql, &params)
-        })();
+        };
         info!(
             elapsed_ms = elapsed_ms(started),
             ok = result.is_ok(),

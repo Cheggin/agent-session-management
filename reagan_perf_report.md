@@ -134,3 +134,39 @@ Sources inspected:
 
 - Background reindex uses a second SQLite connection. The verification run completed cleanly, but very large future indexes could still benefit from a dedicated progress indicator or cancellation.
 - Search body load is intentionally simple and synchronous on first non-empty search. If real body dumps become much larger than observed here, move only that load to a background worker.
+
+## Round 2: SQL pushdown
+
+Date: 2026-05-23
+Method: release build once, then run `/usr/bin/time -p target/release/asm --benchmark` five times before and after moving the default/drop and cheap chip predicates into SQLite. The `--benchmark` path performs normal TUI startup through the first render, restores the terminal when attached to a TTY, prints `asm benchmark: <ms>ms`, and exits. These runs used the prebuilt `target/release/asm` binary rather than `cargo run`.
+
+### End-to-end wall-clock timings
+
+| state | command | `asm benchmark` runs (ms) | median `asm benchmark` | `/usr/bin/time real` runs (s) | median `real` |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Before SQL pushdown | `/usr/bin/time -p target/release/asm --benchmark` | 25, 22, 23, 24, 22 | 23ms | 0.38, 0.02, 0.02, 0.02, 0.02 | 0.02s |
+| After SQL pushdown | `/usr/bin/time -p target/release/asm --benchmark` | 21, 17, 19, 17, 19 | 19ms | 0.41, 0.02, 0.02, 0.02, 0.02 | 0.02s |
+
+The median full-process wall clock stayed at the coarse `/usr/bin/time` floor of ~20ms, while the benchmark's process-internal first-render wall clock improved from 23ms to 19ms on this small local index/window. The main expected win is less row materialization for default `@here` and other cheap chips as the index grows.
+
+### Changes
+
+- Added `asm --benchmark`, which starts the TUI, performs exactly one draw, prints the wall-clock duration, and exits without requiring interactive input.
+- Added `task bench`; it builds `target/release/asm`, uses `hyperfine` when present, and falls back to `/usr/bin/time -p target/release/asm --benchmark` when absent.
+- Added `Index::list_filtered(&[Chip])`, pushing these predicates into SQLite: `@here`, `@claude`/`@codex`, `@branch:<name>`, and `@path:<substring>`.
+- Moved default exclusions into the SQL filtered path: sidechains, zero-user-message sessions, and SDK/exec entrypoints are omitted before rows are materialized.
+- Kept recency/running/find behavior in memory; fuzzy search still runs against the smaller filtered set.
+- Re-query is lazy on pushdown-chip removal so broadening a filtered list loads the newly eligible rows with the remaining pushdown chips.
+
+### Surprises
+
+- The first `/usr/bin/time` run in both before/after sets was a large outlier (`0.38s` and `0.41s`) even though the benchmark-reported first-render time was only `25ms`/`21ms`. Repeated runs settled at `0.02s`, so the reported wall-clock comparison uses the requested median of five.
+- `time task up -- --benchmark` completed and printed a sane benchmark (`asm benchmark: 26ms`), but its full wall time was `0.71s` because `task up` still shells through `cargo run --release`; the measurement table intentionally uses the prebuilt binary to avoid cargo overhead.
+
+### Validation
+
+- `cargo build --release` passed.
+- `cargo test` passed: 55 tests, including 5 new `tests/sql_pushdown.rs` tests.
+- `cargo clippy --all-targets -- -D warnings` passed.
+- `task bench` passed via `/usr/bin/time` fallback on this machine.
+- `/usr/bin/time -p task up -- --benchmark` passed and printed `asm benchmark: 26ms`.
