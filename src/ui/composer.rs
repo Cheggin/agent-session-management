@@ -15,6 +15,31 @@ impl Composer {
         self.cursor
     }
 
+    pub(crate) fn remove_range(&mut self, start: usize, end: usize) {
+        if start >= end {
+            return;
+        }
+
+        let start = start.min(self.input_len());
+        let end = end.min(self.input_len());
+        if start >= end {
+            return;
+        }
+
+        let byte_start = char_to_byte_idx(&self.text, start);
+        let byte_end = char_to_byte_idx(&self.text, end);
+        self.text.replace_range(byte_start..byte_end, "");
+
+        let removed_len = end - start;
+        self.cursor = if self.cursor <= start {
+            self.cursor
+        } else if self.cursor >= end {
+            self.cursor - removed_len
+        } else {
+            start
+        };
+    }
+
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()
     }

@@ -1,12 +1,12 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::UNIX_EPOCH,
+    time::{Instant, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
 use rayon::prelude::*;
-use tracing::{info, warn};
+use tracing::{info, info_span, warn};
 
 use crate::{
     ClaudeParser, CodexParser, Parser, Session,
@@ -40,17 +40,28 @@ pub fn reindex_all(
     claude_root: &Path,
     codex_root: &Path,
 ) -> Result<ReindexStats> {
-    let mut discovered = Vec::new();
-    discovered.extend(
-        scan_claude(claude_root)
-            .into_iter()
-            .map(|path| (Source::Claude, path)),
-    );
-    discovered.extend(
-        scan_codex(codex_root)
-            .into_iter()
-            .map(|path| (Source::Codex, path)),
-    );
+    let discovered = {
+        let span = info_span!("asm.reindex.discover");
+        let _enter = span.enter();
+        let started = Instant::now();
+        let mut discovered = Vec::new();
+        discovered.extend(
+            scan_claude(claude_root)
+                .into_iter()
+                .map(|path| (Source::Claude, path)),
+        );
+        discovered.extend(
+            scan_codex(codex_root)
+                .into_iter()
+                .map(|path| (Source::Codex, path)),
+        );
+        info!(
+            elapsed_ms = elapsed_ms(started),
+            discovered = discovered.len(),
+            "startup phase complete"
+        );
+        discovered
+    };
 
     let mut stats = ReindexStats {
         discovered: discovered.len(),
@@ -58,28 +69,40 @@ pub fn reindex_all(
     };
 
     let mut candidates = Vec::new();
-    for (source, path) in discovered {
-        let path_mtime = match path_mtime(&path) {
-            Ok(path_mtime) => path_mtime,
-            Err(error) => {
-                stats.failed += 1;
-                warn!(path = %path.display(), error = %error, "failed to stat session file");
+    {
+        let span = info_span!("asm.reindex.filter");
+        let _enter = span.enter();
+        let started = Instant::now();
+        for (source, path) in discovered {
+            let path_mtime = match path_mtime(&path) {
+                Ok(path_mtime) => path_mtime,
+                Err(error) => {
+                    stats.failed += 1;
+                    warn!(path = %path.display(), error = %error, "failed to stat session file");
+                    continue;
+                }
+            };
+
+            if index.get_path_mtime(&path)? == Some(path_mtime)
+                && index.path_has_message_bodies(&path)?
+            {
+                stats.skipped_unchanged += 1;
                 continue;
             }
-        };
 
-        if index.get_path_mtime(&path)? == Some(path_mtime)
-            && index.path_has_message_bodies(&path)?
-        {
-            stats.skipped_unchanged += 1;
-            continue;
+            candidates.push(Candidate {
+                source,
+                path,
+                path_mtime,
+            });
         }
-
-        candidates.push(Candidate {
-            source,
-            path,
-            path_mtime,
-        });
+        info!(
+            elapsed_ms = elapsed_ms(started),
+            changed = candidates.len(),
+            skipped_unchanged = stats.skipped_unchanged,
+            failed = stats.failed,
+            "startup phase complete"
+        );
     }
 
     info!(
@@ -89,7 +112,19 @@ pub fn reindex_all(
         "session files discovered"
     );
 
-    let parse_results: Vec<_> = candidates.into_par_iter().map(parse_candidate).collect();
+    let parse_results: Vec<_> = {
+        let span = info_span!("asm.reindex.parse");
+        let _enter = span.enter();
+        let started = Instant::now();
+        let candidate_count = candidates.len();
+        let parse_results: Vec<_> = candidates.into_par_iter().map(parse_candidate).collect();
+        info!(
+            elapsed_ms = elapsed_ms(started),
+            candidates = candidate_count,
+            "startup phase complete"
+        );
+        parse_results
+    };
     let mut parsed_sessions = Vec::new();
     for result in parse_results {
         match result {
@@ -102,7 +137,20 @@ pub fn reindex_all(
     }
 
     stats.parsed = parsed_sessions.len();
-    index.upsert_sessions(&parsed_sessions)?;
+    {
+        let span = info_span!("asm.reindex.write");
+        let _enter = span.enter();
+        let started = Instant::now();
+        let result = index.upsert_sessions(&parsed_sessions);
+        info!(
+            elapsed_ms = elapsed_ms(started),
+            parsed = stats.parsed,
+            ok = result.is_ok(),
+            "startup phase complete"
+        );
+        result?;
+    }
+    index.mark_reindexed_now()?;
 
     info!(
         discovered = stats.discovered,
@@ -113,6 +161,10 @@ pub fn reindex_all(
     );
 
     Ok(stats)
+}
+
+fn elapsed_ms(started: Instant) -> u128 {
+    started.elapsed().as_millis()
 }
 
 fn parse_candidate(

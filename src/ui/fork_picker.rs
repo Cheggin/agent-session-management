@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use chrono::{DateTime, Utc};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -11,7 +12,7 @@ use crate::{
     fork::{end_cut_index, read_turns},
 };
 
-use super::{preview, theme};
+use super::theme;
 
 #[derive(Debug, Clone)]
 pub struct ForkPicker {
@@ -45,7 +46,7 @@ impl ForkPicker {
             label: format!(
                 "{:>4}  {}",
                 turn.timestamp
-                    .map(preview::relative_time)
+                    .map(relative_time)
                     .unwrap_or_else(|| "n/a".to_owned()),
                 truncate(&turn.message.replace('\n', " "), 80)
             ),
@@ -171,6 +172,19 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
         y: area.y + (area.height - height) / 2,
         width,
         height,
+    }
+}
+
+fn relative_time(time: DateTime<Utc>) -> String {
+    let delta = Utc::now().signed_duration_since(time);
+    if delta.num_minutes() < 1 {
+        "now".to_owned()
+    } else if delta.num_hours() < 1 {
+        format!("{}m", delta.num_minutes())
+    } else if delta.num_days() < 1 {
+        format!("{}h", delta.num_hours())
+    } else {
+        format!("{}d", delta.num_days())
     }
 }
 

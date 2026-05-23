@@ -42,10 +42,6 @@ pub fn text_style() -> Style {
     Style::default().fg(text())
 }
 
-pub fn bold() -> Style {
-    text_style().add_modifier(Modifier::BOLD)
-}
-
 pub fn muted() -> Style {
     Style::default().fg(muted_color())
 }
@@ -88,6 +84,10 @@ pub fn toast() -> Style {
         .fg(surface())
         .bg(green())
         .add_modifier(Modifier::BOLD)
+}
+
+pub fn spark() -> Style {
+    Style::default().fg(accent_color())
 }
 
 pub fn agent(agent: &Agent) -> Style {

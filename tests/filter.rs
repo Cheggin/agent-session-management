@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::Path};
 
 use asm::{
-    Agent, Session,
+    Agent, Entrypoint, Session,
     ui::filter::{
         Chip, apply_filters, apply_filters_with_haystacks, build_session_haystacks,
         parse_filter_text,
@@ -93,6 +93,28 @@ fn apply_filters_keeps_visible_sessions_sorted_live_then_recent() {
         ),
         ["repo"]
     );
+}
+
+#[test]
+fn apply_filters_drops_sdk_entrypoint_by_default() {
+    let mut sdk = session("sdk", Agent::Claude, 10);
+    sdk.entrypoint = Some(Entrypoint::Sdk);
+    let mut cli = session("cli", Agent::Claude, 20);
+    cli.entrypoint = Some(Entrypoint::Cli);
+    let sessions = vec![sdk, cli];
+
+    assert_eq!(ids(&sessions, &apply_filters(&sessions, &[], "")), ["cli"]);
+}
+
+#[test]
+fn apply_filters_drops_exec_entrypoint_by_default() {
+    let mut exec = session("exec", Agent::Codex, 10);
+    exec.entrypoint = Some(Entrypoint::Exec);
+    let mut tui = session("tui", Agent::Codex, 20);
+    tui.entrypoint = Some(Entrypoint::Tui);
+    let sessions = vec![exec, tui];
+
+    assert_eq!(ids(&sessions, &apply_filters(&sessions, &[], "")), ["tui"]);
 }
 
 #[test]

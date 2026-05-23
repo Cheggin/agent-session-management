@@ -86,3 +86,23 @@ A PTY smoke captured the TUI rendering the seeded `@find:storage` chip and narro
 - Removed remaining non-report `was_compacted` references from the planning/schema docs.
 - Added a root `Taskfile.yml` with build, test, watch, lint, format, run, reindex, install, shell hook, and clean tasks.
 - Final `cargo test` count: 30 tests passed.
+
+## Followups 2026-05-23 (round 2)
+
+- Removed preview code: `src/ui/preview.rs` deleted outright (170 lines); additional preview-pane/module cleanup removed 35 lines from `src/ui/render.rs`, 1 line from `src/ui/mod.rs`, 2 preview-module reference lines from `src/ui/fork_picker.rs`, and 4 now-unused preview style lines from `src/ui/theme.rs` (212 removed preview-related lines total before replacement helpers).
+- Real reindex sqlite count for non-interactive default drops: `entrypoint=exec` 210, `entrypoint=sdk` 556, total 766 rows newly dropped by the entrypoint predicate after excluding sessions already dropped for sidechain/zero-user-message. Raw non-interactive sqlite rows: 767.
+- Final `cargo test` count: 32 tests passed.
+
+## Followups 2026-05-23 (round 3)
+
+- Routed TUI tracing for bare `asm` and `asm ls` to `~/.config/asm/asm.log` via `tracing-appender` non-blocking file logging, while keeping non-TUI subcommands on stderr.
+- Default-scoped the TUI list to the current directory by auto-seeding `@here`; `--filter` chips now append `@here` unless a `here`/`@here` token is already present.
+- Added `--global` for bare `asm` and `asm ls` to opt out of the automatic `@here` chip.
+- Validation: `cargo build --release`, `cargo test` (37 tests passed), and `cargo clippy --all-targets -- -D warnings` all passed. Manual TUI smoke saw the `@here` chip, captured empty stderr, and confirmed fresh `~/.config/asm/asm.log` entries from the run.
+
+## Followups 2026-05-23 (round 4)
+
+- Moved completed typed chips out of the visible composer buffer into `live_chips`; `@claude ` / `@here ` now render only as chips after the terminating space, while unterminated tokens like `@here` and partial tokens like `@cla` remain literal search text.
+- Backspace at composer cursor-start now removes the most recently typed live chip before falling back to seeded chips, preserving seeded-first visual order without making seeded chips consume first.
+- Added composer extraction regressions for plain search text, terminated chips, multi-chip paste, unterminated/partial chip tokens, and live-before-seeded backspace priority.
+- Validation: `cargo build --release`, `cargo test` (48 tests passed), and `cargo clippy --all-targets -- -D warnings` all passed. The `asm` command was not on PATH in this shell, so manual PTY smoke used `target/release/asm --global`; typing `@claude ` cleared the input text back to the placeholder while the `@claude` chip rendered above.

@@ -61,3 +61,15 @@ fn sqlite_index_upserting_same_path_updates_mtime_without_duplicate_rows() {
     assert_eq!(sessions[0], session);
     assert_eq!(index.get_path_mtime(&session.path).unwrap(), Some(2));
 }
+
+#[test]
+fn sqlite_index_tracks_last_reindex_age() {
+    let temp = tempfile::tempdir().unwrap();
+    let index = Index::open_in_dir(temp.path()).unwrap();
+
+    assert!(index.last_reindex_age().unwrap().is_none());
+
+    index.mark_reindexed_now().unwrap();
+
+    assert!(index.last_reindex_age().unwrap().unwrap().as_secs() < 5);
+}

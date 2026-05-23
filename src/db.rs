@@ -18,13 +18,15 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
+use tracing::{info, info_span};
 
-use crate::{Agent, Entrypoint, Session};
+use crate::{Agent, Entrypoint, Session, ui::filter::Chip};
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS sessions (
@@ -51,7 +53,14 @@ CREATE INDEX IF NOT EXISTS idx_sidechain    ON sessions(is_sidechain);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts
 USING fts5(session_id UNINDEXED, body, tokenize='porter unicode61');
+
+CREATE TABLE IF NOT EXISTS meta (
+  key TEXT PRIMARY KEY,
+  value INTEGER NOT NULL
+);
 "#;
+
+const META_LAST_REINDEX_AT_SECS: &str = "last_reindex_at_secs";
 
 const UPSERT_SESSION: &str = r#"
 INSERT INTO sessions (
@@ -102,18 +111,29 @@ impl Index {
     }
 
     pub fn open_at(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create index directory {}", parent.display())
-            })?;
-        }
+        let span = info_span!("asm.db.open");
+        let _enter = span.enter();
+        let started = Instant::now();
+        let result = (|| {
+            let path = path.as_ref();
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create index directory {}", parent.display())
+                })?;
+            }
 
-        let conn = Connection::open(path)
-            .with_context(|| format!("failed to open SQLite index {}", path.display()))?;
-        let index = Self { conn };
-        index.migrate()?;
-        Ok(index)
+            let conn = Connection::open(path)
+                .with_context(|| format!("failed to open SQLite index {}", path.display()))?;
+            let index = Self { conn };
+            index.migrate()?;
+            Ok(index)
+        })();
+        info!(
+            elapsed_ms = elapsed_ms(started),
+            ok = result.is_ok(),
+            "startup phase complete"
+        );
+        result
     }
 
     pub fn upsert_session(
@@ -193,21 +213,32 @@ impl Index {
     }
 
     pub fn dump_message_bodies(&self) -> Result<HashMap<String, String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT session_id, body FROM messages_fts ORDER BY rowid")?;
-        let mut rows = stmt.query([])?;
-        let mut bodies = HashMap::<String, String>::new();
-        while let Some(row) = rows.next()? {
-            let session_id: String = row.get(0)?;
-            let body: String = row.get(1)?;
-            let entry = bodies.entry(session_id).or_default();
-            if !entry.is_empty() {
-                entry.push('\n');
+        let span = info_span!("asm.db.dump_bodies");
+        let _enter = span.enter();
+        let started = Instant::now();
+        let result = (|| {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT session_id, body FROM messages_fts ORDER BY rowid")?;
+            let mut rows = stmt.query([])?;
+            let mut bodies = HashMap::<String, String>::new();
+            while let Some(row) = rows.next()? {
+                let session_id: String = row.get(0)?;
+                let body: String = row.get(1)?;
+                let entry = bodies.entry(session_id).or_default();
+                if !entry.is_empty() {
+                    entry.push('\n');
+                }
+                entry.push_str(&body);
             }
-            entry.push_str(&body);
-        }
-        Ok(bodies)
+            Ok(bodies)
+        })();
+        info!(
+            elapsed_ms = elapsed_ms(started),
+            ok = result.is_ok(),
+            "startup phase complete"
+        );
+        result
     }
 
     pub fn get_path_mtime(&self, path: impl AsRef<Path>) -> Result<Option<i64>> {
@@ -245,9 +276,37 @@ WHERE path = ?1
             .map_err(Into::into)
     }
 
-    pub fn list_all(&self) -> Result<Vec<Session>> {
-        let mut stmt = self.conn.prepare(
+    pub fn last_reindex_age(&self) -> Result<Option<Duration>> {
+        let Some(last_reindex_at_secs) = self.last_reindex_at_secs()? else {
+            return Ok(None);
+        };
+        let now_secs = unix_now_secs()?;
+        let age_secs = now_secs.saturating_sub(last_reindex_at_secs);
+        Ok(Some(Duration::from_secs(
+            u64::try_from(age_secs).unwrap_or(0),
+        )))
+    }
+
+    pub fn mark_reindexed_now(&self) -> Result<()> {
+        let now_secs = unix_now_secs()?;
+        self.conn.execute(
             r#"
+INSERT INTO meta (key, value)
+VALUES (?1, ?2)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value
+"#,
+            params![META_LAST_REINDEX_AT_SECS, now_secs],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_all(&self) -> Result<Vec<Session>> {
+        let span = info_span!("asm.db.list_all");
+        let _enter = span.enter();
+        let started = Instant::now();
+        let result = (|| {
+            self.query_sessions(
+                r#"
 SELECT
   id,
   agent,
@@ -266,61 +325,89 @@ SELECT
 FROM sessions
 ORDER BY last_user_msg_at DESC, started_at DESC, id ASC
 "#,
-        )?;
+                &[],
+            )
+        })();
+        info!(
+            elapsed_ms = elapsed_ms(started),
+            ok = result.is_ok(),
+            "startup phase complete"
+        );
+        result
+    }
 
-        let mut rows = stmt.query([])?;
+    pub fn list_filtered(&self, chips: &[Chip]) -> Result<Vec<Session>> {
+        let span = info_span!("asm.db.list_filtered");
+        let _enter = span.enter();
+        let started = Instant::now();
+        let result = (|| {
+            let mut sql = String::from(
+                r#"
+SELECT
+  id,
+  agent,
+  path,
+  cwd,
+  git_branch,
+  entrypoint,
+  title,
+  first_user_prompt,
+  last_assistant_text,
+  started_at,
+  last_user_msg_at,
+  last_assistant_msg_at,
+  user_msg_count,
+  is_sidechain
+FROM sessions
+WHERE is_sidechain = 0
+  AND user_msg_count > 0
+  AND (entrypoint IS NULL OR entrypoint NOT IN ('sdk', 'exec'))
+"#,
+            );
+            let mut params = Vec::<String>::new();
+
+            for chip in chips {
+                match chip {
+                    Chip::HereCwd(path) => {
+                        let cwd = path_to_db(path);
+                        sql.push_str("  AND (cwd = ? OR cwd LIKE ?)\n");
+                        params.push(cwd.clone());
+                        params.push(descendant_like_pattern(&cwd));
+                    }
+                    Chip::Agent(agent) => {
+                        sql.push_str("  AND agent = ?\n");
+                        params.push(encode_agent(agent).to_owned());
+                    }
+                    Chip::Branch(branch) => {
+                        sql.push_str("  AND LOWER(git_branch) = LOWER(?)\n");
+                        params.push(branch.clone());
+                    }
+                    Chip::PathSubstring(path) => {
+                        sql.push_str("  AND LOWER(cwd) LIKE '%' || LOWER(?) || '%'\n");
+                        params.push(path.clone());
+                    }
+                    Chip::Recency(_) | Chip::Running => {}
+                }
+            }
+
+            sql.push_str("ORDER BY last_user_msg_at DESC");
+            self.query_sessions(&sql, &params)
+        })();
+        info!(
+            elapsed_ms = elapsed_ms(started),
+            ok = result.is_ok(),
+            "startup phase complete"
+        );
+        result
+    }
+
+    fn query_sessions(&self, sql: &str, params: &[String]) -> Result<Vec<Session>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut rows = stmt.query(params_from_iter(params.iter()))?;
         let mut sessions = Vec::new();
         while let Some(row) = rows.next()? {
-            let id: String = row.get(0)?;
-            let agent_raw: String = row.get(1)?;
-            let path_raw: String = row.get(2)?;
-            let cwd_raw: Option<String> = row.get(3)?;
-            let git_branch: Option<String> = row.get(4)?;
-            let entrypoint_raw: Option<String> = row.get(5)?;
-            let title: Option<String> = row.get(6)?;
-            let first_user_prompt: Option<String> = row.get(7)?;
-            let last_assistant_text: Option<String> = row.get(8)?;
-            let started_raw: String = row.get(9)?;
-            let last_user_raw: Option<String> = row.get(10)?;
-            let last_assistant_raw: Option<String> = row.get(11)?;
-            let user_msg_count_raw: i64 = row.get(12)?;
-            let is_sidechain_raw: i64 = row.get(13)?;
-
-            sessions.push(Session {
-                id: id.clone(),
-                agent: decode_agent(&agent_raw)
-                    .with_context(|| format!("invalid agent for session {id}"))?,
-                path: PathBuf::from(path_raw),
-                cwd: cwd_raw.map(PathBuf::from),
-                git_branch,
-                entrypoint: entrypoint_raw
-                    .as_deref()
-                    .map(decode_entrypoint)
-                    .transpose()
-                    .with_context(|| format!("invalid entrypoint for session {id}"))?,
-                title,
-                first_user_prompt,
-                last_assistant_text,
-                started_at: decode_datetime(&started_raw)
-                    .with_context(|| format!("invalid started_at for session {id}"))?,
-                last_user_msg_at: last_user_raw
-                    .as_deref()
-                    .map(decode_datetime)
-                    .transpose()
-                    .with_context(|| format!("invalid last_user_msg_at for session {id}"))?,
-                last_assistant_msg_at: last_assistant_raw
-                    .as_deref()
-                    .map(decode_datetime)
-                    .transpose()
-                    .with_context(|| format!("invalid last_assistant_msg_at for session {id}"))?,
-                user_msg_count: u32::try_from(user_msg_count_raw).with_context(|| {
-                    format!("invalid user_msg_count {user_msg_count_raw} for session {id}")
-                })?,
-                is_live: false,
-                is_sidechain: is_sidechain_raw != 0,
-            });
+            sessions.push(session_from_row(row)?);
         }
-
         Ok(sessions)
     }
 
@@ -328,6 +415,80 @@ ORDER BY last_user_msg_at DESC, started_at DESC, id ASC
         self.conn.execute_batch(SCHEMA)?;
         Ok(())
     }
+
+    fn last_reindex_at_secs(&self) -> Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![META_LAST_REINDEX_AT_SECS],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+}
+
+fn session_from_row(row: &Row<'_>) -> Result<Session> {
+    let id: String = row.get(0)?;
+    let agent_raw: String = row.get(1)?;
+    let path_raw: String = row.get(2)?;
+    let cwd_raw: Option<String> = row.get(3)?;
+    let git_branch: Option<String> = row.get(4)?;
+    let entrypoint_raw: Option<String> = row.get(5)?;
+    let title: Option<String> = row.get(6)?;
+    let first_user_prompt: Option<String> = row.get(7)?;
+    let last_assistant_text: Option<String> = row.get(8)?;
+    let started_raw: String = row.get(9)?;
+    let last_user_raw: Option<String> = row.get(10)?;
+    let last_assistant_raw: Option<String> = row.get(11)?;
+    let user_msg_count_raw: i64 = row.get(12)?;
+    let is_sidechain_raw: i64 = row.get(13)?;
+
+    Ok(Session {
+        id: id.clone(),
+        agent: decode_agent(&agent_raw)
+            .with_context(|| format!("invalid agent for session {id}"))?,
+        path: PathBuf::from(path_raw),
+        cwd: cwd_raw.map(PathBuf::from),
+        git_branch,
+        entrypoint: entrypoint_raw
+            .as_deref()
+            .map(decode_entrypoint)
+            .transpose()
+            .with_context(|| format!("invalid entrypoint for session {id}"))?,
+        title,
+        first_user_prompt,
+        last_assistant_text,
+        started_at: decode_datetime(&started_raw)
+            .with_context(|| format!("invalid started_at for session {id}"))?,
+        last_user_msg_at: last_user_raw
+            .as_deref()
+            .map(decode_datetime)
+            .transpose()
+            .with_context(|| format!("invalid last_user_msg_at for session {id}"))?,
+        last_assistant_msg_at: last_assistant_raw
+            .as_deref()
+            .map(decode_datetime)
+            .transpose()
+            .with_context(|| format!("invalid last_assistant_msg_at for session {id}"))?,
+        user_msg_count: u32::try_from(user_msg_count_raw).with_context(|| {
+            format!("invalid user_msg_count {user_msg_count_raw} for session {id}")
+        })?,
+        is_live: false,
+        is_sidechain: is_sidechain_raw != 0,
+    })
+}
+
+fn elapsed_ms(started: Instant) -> u128 {
+    started.elapsed().as_millis()
+}
+
+fn unix_now_secs() -> Result<i64> {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system time is before Unix epoch")?
+        .as_secs();
+    i64::try_from(secs).context("current Unix time overflows i64")
 }
 
 fn default_index_path() -> Result<PathBuf> {
@@ -400,6 +561,14 @@ fn execute_upsert_with_bodies(
 
 fn path_to_db(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+fn descendant_like_pattern(cwd: &str) -> String {
+    if cwd == "/" {
+        "/%".to_owned()
+    } else {
+        format!("{}/%", cwd.trim_end_matches('/'))
+    }
 }
 
 fn encode_datetime(datetime: &DateTime<Utc>) -> Result<String> {

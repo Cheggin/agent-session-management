@@ -1,10 +1,11 @@
 use std::path::Path;
 
+use chrono::{DateTime, Utc};
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Position, Rect},
+    layout::{Constraint, Direction, Layout, Margin, Position, Rect},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Padding, Paragraph},
 };
 
 use crate::{Agent, Session};
@@ -12,19 +13,41 @@ use crate::{Agent, Session};
 use super::{
     app::App,
     filter::{Chip, chip_label},
-    fork_picker, preview, theme,
+    fork_picker, sparkline, theme,
 };
 
+const SPARK_HOURS: usize = 24;
+const SPARK_MIN_SESSIONS: usize = 2;
+
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
-    let area = frame.area();
+    let full = frame.area();
+    let area = full.inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
     let show_chips = !app.chips.is_empty() || app.toast_text().is_some();
+    let spark_buckets = if app.filtered_count() >= SPARK_MIN_SESSIONS {
+        let b = sparkline::hourly_start_buckets(app.filtered_sessions(), Utc::now(), SPARK_HOURS);
+        (b.iter().sum::<u32>() > 0).then_some(b)
+    } else {
+        None
+    };
+    let show_spark = spark_buckets.is_some();
+
     let mut constraints = Vec::new();
     if show_chips {
+        constraints.push(Constraint::Length(1));
+        constraints.push(Constraint::Length(1));
+    }
+    if show_spark {
+        constraints.push(Constraint::Length(1));
         constraints.push(Constraint::Length(1));
     }
     constraints.extend([
         Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Min(1),
+        Constraint::Length(1),
         Constraint::Length(1),
     ]);
     let rows = Layout::default()
@@ -35,16 +58,20 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     let mut row_idx = 0;
     if show_chips {
         render_chip_strip(frame, rows[row_idx], app);
-        row_idx += 1;
+        row_idx += 2;
+    }
+    if let Some(buckets) = spark_buckets.as_ref() {
+        sparkline::render_strip(frame, rows[row_idx], buckets);
+        row_idx += 2;
     }
     render_input(frame, rows[row_idx], app);
-    row_idx += 1;
+    row_idx += 2;
     render_middle(frame, rows[row_idx], app);
-    row_idx += 1;
+    row_idx += 2;
     render_hint(frame, rows[row_idx]);
 
     if let Some(picker) = app.fork_picker_mut() {
-        fork_picker::render_overlay(frame, area, picker);
+        fork_picker::render_overlay(frame, full, picker);
     }
 }
 
@@ -98,18 +125,14 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_middle(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(area);
-    render_list(frame, cols[0], app);
-    render_preview(frame, cols[1], app);
+    render_list(frame, area, app);
 }
 
 fn render_list(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::border())
+        .padding(Padding::new(2, 2, 1, 1))
         .title(" sessions ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -137,31 +160,6 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn render_preview(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme::border())
-        .title(" preview ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let lines = app
-        .selected_session()
-        .map(|session| preview::lines(session, inner.width as usize))
-        .unwrap_or_else(|| {
-            vec![Line::from(Span::styled(
-                "No session selected.",
-                theme::dim(),
-            ))]
-        });
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(theme::text_style())
-            .wrap(Wrap { trim: false }),
-        inner,
-    );
-}
-
 fn render_hint(frame: &mut Frame<'_>, area: Rect) {
     let hint = "enter resume   ctrl-f fork   ctrl-e export   ↑/↓ select   pgup/pgdn page   ctrl-r/F5 reindex   esc/ctrl-c quit";
     frame.render_widget(
@@ -173,7 +171,7 @@ fn render_hint(frame: &mut Frame<'_>, area: Rect) {
 fn list_row(session: &Session, width: usize) -> Line<'static> {
     let live = if session.is_live { "●" } else { " " };
     let agent = agent_name(&session.agent);
-    let relative = preview::relative_time(preview::activity_time(session));
+    let relative = relative_time(activity_time(session));
     let cwd_tail = session.cwd.as_deref().map(cwd_tail).unwrap_or_default();
     let branch = session.git_branch.as_deref().unwrap_or_default();
 
@@ -181,7 +179,7 @@ fn list_row(session: &Session, width: usize) -> Line<'static> {
     let branch_w = width.saturating_sub(62).min(22);
     let fixed = 2 + 8 + 5 + cwd_w + branch_w + 6;
     let title_w = width.saturating_sub(fixed).max(8);
-    let title = truncate(&preview::session_title(session), title_w);
+    let title = truncate(&session_title(session), title_w);
 
     Line::from(vec![
         Span::styled(
@@ -241,6 +239,32 @@ fn cwd_tail(path: &Path) -> String {
         .collect();
     let start = parts.len().saturating_sub(2);
     parts[start..].join("/")
+}
+
+fn session_title(session: &Session) -> String {
+    session
+        .title
+        .as_deref()
+        .or(session.first_user_prompt.as_deref())
+        .unwrap_or(&session.id)
+        .to_owned()
+}
+
+fn activity_time(session: &Session) -> DateTime<Utc> {
+    session.last_user_msg_at.unwrap_or(session.started_at)
+}
+
+fn relative_time(time: DateTime<Utc>) -> String {
+    let delta = Utc::now().signed_duration_since(time);
+    if delta.num_minutes() < 1 {
+        "now".to_owned()
+    } else if delta.num_hours() < 1 {
+        format!("{}m", delta.num_minutes())
+    } else if delta.num_days() < 1 {
+        format!("{}h", delta.num_hours())
+    } else {
+        format!("{}d", delta.num_days())
+    }
 }
 
 fn truncate(value: &str, width: usize) -> String {

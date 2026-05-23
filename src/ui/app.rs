@@ -1,16 +1,18 @@
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration as StdDuration, Instant},
 };
 
 use chrono::{DateTime, Utc};
+use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::{Session, liveness::mark_live_sessions, reindex::ReindexStats};
 
 use super::{
     composer::Composer,
-    filter::{Chip, apply_filters_with_haystacks, build_session_haystacks, parse_filter_text},
+    filter::{Chip, apply_filters_with_haystacks, build_session_haystacks_optional, parse_chip},
     fork_picker::ForkPicker,
 };
 
@@ -18,6 +20,7 @@ use super::{
 pub struct App {
     pub(crate) sessions: Vec<Session>,
     session_haystacks: Vec<String>,
+    message_bodies: Option<Arc<HashMap<String, String>>>,
     pub(crate) filtered_indices: Vec<usize>,
     pub(crate) selected: usize,
     pub(crate) scroll_offset: usize,
@@ -29,6 +32,8 @@ pub struct App {
     pub(crate) last_reindex_time: Option<DateTime<Utc>>,
     fork_picker: Option<ForkPicker>,
     seeded_chips: Vec<Chip>,
+    live_chips: Vec<Chip>,
+    pushdown_filter_dirty: bool,
     toast: Option<Toast>,
 }
 
@@ -48,21 +53,37 @@ impl App {
         current_cwd: PathBuf,
         seeded_chips: Vec<Chip>,
     ) -> Self {
-        Self::new_with_chips_and_bodies(sessions, current_cwd, seeded_chips, HashMap::new())
+        Self::new_inner(sessions, current_cwd, seeded_chips, None)
     }
 
     pub fn new_with_chips_and_bodies(
-        mut sessions: Vec<Session>,
+        sessions: Vec<Session>,
         current_cwd: PathBuf,
         seeded_chips: Vec<Chip>,
         message_bodies: HashMap<String, String>,
     ) -> Self {
+        Self::new_inner(
+            sessions,
+            current_cwd,
+            seeded_chips,
+            Some(Arc::new(message_bodies)),
+        )
+    }
+
+    fn new_inner(
+        mut sessions: Vec<Session>,
+        current_cwd: PathBuf,
+        seeded_chips: Vec<Chip>,
+        message_bodies: Option<Arc<HashMap<String, String>>>,
+    ) -> Self {
         let current_cwd = current_cwd.canonicalize().unwrap_or(current_cwd);
         mark_live_sessions(&mut sessions);
-        let session_haystacks = build_session_haystacks(&sessions, &message_bodies);
+        let session_haystacks =
+            build_session_haystacks_optional(&sessions, message_bodies.as_deref());
         let mut app = Self {
             sessions,
             session_haystacks,
+            message_bodies,
             filtered_indices: Vec::new(),
             selected: 0,
             scroll_offset: 0,
@@ -74,6 +95,8 @@ impl App {
             last_reindex_time: None,
             fork_picker: None,
             seeded_chips,
+            live_chips: Vec::new(),
+            pushdown_filter_dirty: false,
             toast: None,
         };
         app.refresh_filters();
@@ -82,7 +105,8 @@ impl App {
 
     pub fn set_sessions(&mut self, mut sessions: Vec<Session>) {
         mark_live_sessions(&mut sessions);
-        self.session_haystacks = build_session_haystacks(&sessions, &HashMap::new());
+        self.session_haystacks =
+            build_session_haystacks_optional(&sessions, self.message_bodies.as_deref());
         self.sessions = sessions;
         self.refresh_filters();
     }
@@ -93,20 +117,37 @@ impl App {
         message_bodies: HashMap<String, String>,
     ) {
         mark_live_sessions(&mut sessions);
-        self.session_haystacks = build_session_haystacks(&sessions, &message_bodies);
+        self.message_bodies = Some(Arc::new(message_bodies));
+        self.session_haystacks =
+            build_session_haystacks_optional(&sessions, self.message_bodies.as_deref());
         self.sessions = sessions;
         self.refresh_filters();
     }
 
+    pub fn set_message_bodies(&mut self, message_bodies: HashMap<String, String>) {
+        self.message_bodies = Some(Arc::new(message_bodies));
+        self.session_haystacks =
+            build_session_haystacks_optional(&self.sessions, self.message_bodies.as_deref());
+        self.refresh_filters();
+    }
+
+    pub fn needs_message_bodies(&self) -> bool {
+        !self.search.is_empty() && self.message_bodies.is_none()
+    }
+
+    pub fn message_bodies_loaded(&self) -> bool {
+        self.message_bodies.is_some()
+    }
+
     pub fn refresh_filters(&mut self) {
-        let parsed = parse_filter_text(self.composer.input(), &self.current_cwd);
+        self.extract_completed_chips();
         self.chips = self
             .seeded_chips
             .iter()
             .cloned()
-            .chain(parsed.chips)
+            .chain(self.live_chips.iter().cloned())
             .collect();
-        self.search = parsed.search;
+        self.search = normalize_search_text(self.composer.input());
         self.filtered_indices = apply_filters_with_haystacks(
             &self.sessions,
             &self.chips,
@@ -116,13 +157,56 @@ impl App {
         self.clamp_selection();
     }
 
-    pub fn remove_seeded_chip_at_cursor_start(&mut self) -> bool {
-        if self.composer.cursor() != 0 || self.seeded_chips.is_empty() {
+    pub fn handle_composer_key(&mut self, key: KeyEvent) -> bool {
+        if matches!(key.code, KeyCode::Backspace) && self.remove_chip_at_cursor_start() {
+            return true;
+        }
+
+        if !self.composer.handle_key(key) {
             return false;
         }
-        self.seeded_chips.pop();
+
         self.refresh_filters();
         true
+    }
+
+    pub fn insert_composer_paste(&mut self, text: &str) -> bool {
+        if !self.composer.insert_paste(text) {
+            return false;
+        }
+
+        self.refresh_filters();
+        true
+    }
+
+    pub fn remove_chip_at_cursor_start(&mut self) -> bool {
+        if self.composer.cursor() != 0 {
+            return false;
+        }
+
+        if let Some(chip) = self.live_chips.pop() {
+            if super::filter::is_sql_pushdown_chip(&chip) {
+                self.pushdown_filter_dirty = true;
+            }
+            self.refresh_filters();
+            return true;
+        }
+
+        let Some(chip) = self.seeded_chips.pop() else {
+            return false;
+        };
+        if super::filter::is_sql_pushdown_chip(&chip) {
+            self.pushdown_filter_dirty = true;
+        }
+
+        self.refresh_filters();
+        true
+    }
+
+    pub fn take_pushdown_filter_dirty(&mut self) -> bool {
+        let dirty = self.pushdown_filter_dirty;
+        self.pushdown_filter_dirty = false;
+        dirty
     }
 
     pub fn chips(&self) -> &[Chip] {
@@ -252,6 +336,12 @@ impl App {
         self.ensure_selected_visible();
     }
 
+    pub fn filtered_sessions(&self) -> impl Iterator<Item = &Session> {
+        self.filtered_indices
+            .iter()
+            .filter_map(|idx| self.sessions.get(*idx))
+    }
+
     pub fn visible_indices(&self) -> impl Iterator<Item = (usize, &Session)> {
         self.filtered_indices
             .iter()
@@ -285,4 +375,47 @@ impl App {
             self.scroll_offset = self.selected + 1 - self.list_height;
         }
     }
+
+    fn extract_completed_chips(&mut self) {
+        while let Some((start, end, chip)) =
+            find_completed_chip(self.composer.input(), &self.current_cwd)
+        {
+            self.composer.remove_range(start, end);
+            self.live_chips.push(chip);
+        }
+    }
+}
+
+fn find_completed_chip(input: &str, current_cwd: &Path) -> Option<(usize, usize, Chip)> {
+    let chars = input.chars().collect::<Vec<_>>();
+    let mut idx = 0;
+
+    while idx < chars.len() {
+        while idx < chars.len() && chars[idx].is_whitespace() {
+            idx += 1;
+        }
+
+        let start = idx;
+        while idx < chars.len() && !chars[idx].is_whitespace() {
+            idx += 1;
+        }
+
+        if start == idx || idx == chars.len() {
+            break;
+        }
+
+        let token = chars[start..idx].iter().collect::<String>();
+        let remove_end = idx + 1;
+        if let Some(chip) = parse_chip(&token, current_cwd) {
+            return Some((start, remove_end, chip));
+        }
+
+        idx = remove_end;
+    }
+
+    None
+}
+
+fn normalize_search_text(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ")
 }

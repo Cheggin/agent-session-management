@@ -3,14 +3,15 @@ pub mod filter;
 mod app;
 mod composer;
 mod fork_picker;
-mod preview;
 mod render;
+mod sparkline;
 mod theme;
 
 use std::{
-    io::{self, Stdout},
+    io::{self, IsTerminal, Stdout},
     path::{Path, PathBuf},
-    time::Duration,
+    sync::mpsc,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -20,8 +21,11 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{Terminal, backend::CrosstermBackend};
-use tracing::info;
+use ratatui::{
+    Terminal,
+    backend::{Backend, CrosstermBackend, TestBackend},
+};
+use tracing::{info, info_span, warn};
 
 use crate::{
     Session, db::Index, export::export_session, fork::fork_session, reindex::reindex_all,
@@ -32,6 +36,7 @@ pub use app::App;
 use filter::Chip;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
+const RECENT_REINDEX_THRESHOLD: Duration = Duration::from_secs(5);
 
 enum UiAction {
     Resume(Session),
@@ -39,28 +44,87 @@ enum UiAction {
     Export(Session),
 }
 
+struct DeferredReindex {
+    claude_root: PathBuf,
+    codex_root: PathBuf,
+}
+
+struct BackgroundReindexComplete {
+    result: std::result::Result<crate::reindex::ReindexStats, String>,
+}
+
+type BackgroundReindexReceiver = mpsc::Receiver<BackgroundReindexComplete>;
+
+enum StartupReindex {
+    Complete(Option<crate::reindex::ReindexStats>),
+    Deferred(DeferredReindex),
+}
+
 pub fn run() -> Result<()> {
-    run_with_filter(Vec::new())
+    let current_cwd = std::env::current_dir().context("failed to read current directory")?;
+    let current_cwd = current_cwd.canonicalize().unwrap_or(current_cwd);
+    run_with_filter(vec![Chip::HereCwd(current_cwd)])
 }
 
 pub fn run_with_filter(seeded_chips: Vec<Chip>) -> Result<()> {
+    run_with_filter_started(seeded_chips, Instant::now())
+}
+
+pub fn run_benchmark_with_filter_started(
+    seeded_chips: Vec<Chip>,
+    startup_started: Instant,
+) -> Result<()> {
     let (claude_root, codex_root) = default_agent_roots()?;
     let mut index = Index::open()?;
-    let stats = reindex_all(&mut index, &claude_root, &codex_root)?;
-    info!(
-        discovered = stats.discovered,
-        parsed = stats.parsed,
-        skipped_unchanged = stats.skipped_unchanged,
-        failed = stats.failed,
-        "initial TUI reindex complete"
-    );
+    let startup_reindex = maybe_reindex_on_startup(&mut index, &claude_root, &codex_root)?;
 
-    let sessions = index.list_all()?;
-    let message_bodies = index.dump_message_bodies()?;
+    let sessions = index.list_filtered(&seeded_chips)?;
     let current_cwd = std::env::current_dir().context("failed to read current directory")?;
-    let mut app =
-        App::new_with_chips_and_bodies(sessions, current_cwd, seeded_chips, message_bodies);
-    app.record_reindex(stats);
+    let mut app = {
+        let span = info_span!("asm.app.new");
+        let _enter = span.enter();
+        let started = Instant::now();
+        let app = App::new_with_chips(sessions, current_cwd, seeded_chips);
+        info!(elapsed_ms = elapsed_ms(started), "startup phase complete");
+        app
+    };
+    match startup_reindex {
+        StartupReindex::Complete(Some(stats)) => app.record_reindex(stats),
+        StartupReindex::Complete(None) => {}
+        StartupReindex::Deferred(_) => app.show_toast("updating index..."),
+    }
+
+    let elapsed = draw_benchmark_frame(&mut app, startup_started)?;
+    println!("asm benchmark: {}ms", elapsed.as_millis());
+    Ok(())
+}
+
+pub fn run_with_filter_started(seeded_chips: Vec<Chip>, startup_started: Instant) -> Result<()> {
+    let (claude_root, codex_root) = default_agent_roots()?;
+    let mut index = Index::open()?;
+    let startup_reindex = maybe_reindex_on_startup(&mut index, &claude_root, &codex_root)?;
+
+    let sessions = index.list_filtered(&seeded_chips)?;
+    let current_cwd = std::env::current_dir().context("failed to read current directory")?;
+    let mut app = {
+        let span = info_span!("asm.app.new");
+        let _enter = span.enter();
+        let started = Instant::now();
+        let app = App::new_with_chips(sessions, current_cwd, seeded_chips);
+        info!(elapsed_ms = elapsed_ms(started), "startup phase complete");
+        app
+    };
+    let deferred_reindex = match startup_reindex {
+        StartupReindex::Complete(Some(stats)) => {
+            app.record_reindex(stats);
+            None
+        }
+        StartupReindex::Complete(None) => None,
+        StartupReindex::Deferred(deferred) => {
+            app.show_toast("updating index...");
+            Some(deferred)
+        }
+    };
 
     let mut terminal = TerminalGuard::enter()?;
     let action = run_event_loop(
@@ -69,6 +133,8 @@ pub fn run_with_filter(seeded_chips: Vec<Chip>) -> Result<()> {
         &mut index,
         &claude_root,
         &codex_root,
+        startup_started,
+        deferred_reindex,
     )?;
 
     if let Some(action) = action {
@@ -94,10 +160,54 @@ fn run_event_loop(
     index: &mut Index,
     claude_root: &Path,
     codex_root: &Path,
+    startup_started: Instant,
+    deferred_reindex: Option<DeferredReindex>,
 ) -> Result<Option<UiAction>> {
+    let event_loop_started = Instant::now();
+    let mut first_render_logged = false;
+    let mut deferred_reindex = deferred_reindex;
+    let mut background_reindex: Option<BackgroundReindexReceiver> = None;
     loop {
         app.clear_expired_toast();
-        terminal.draw(|frame| render::render(frame, app))?;
+        if first_render_logged {
+            terminal.draw(|frame| render::render(frame, app))?;
+        } else {
+            let span = info_span!("asm.first_render");
+            let _enter = span.enter();
+            let render_result = draw_first_frame(terminal, app);
+            info!(
+                elapsed_ms = elapsed_ms(event_loop_started),
+                ok = render_result.is_ok(),
+                "startup phase complete"
+            );
+            render_result?;
+            first_render_logged = true;
+
+            let span = info_span!("asm.startup");
+            let _enter = span.enter();
+            info!(
+                elapsed_ms = elapsed_ms(startup_started),
+                "first frame drawn"
+            );
+            if let Some(deferred) = deferred_reindex.take() {
+                background_reindex = Some(start_background_reindex(deferred));
+            }
+        }
+
+        if let Some(receiver) = background_reindex.take() {
+            match receiver.try_recv() {
+                Ok(complete) => {
+                    handle_background_reindex_complete(complete, index, app)?;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    background_reindex = Some(receiver);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    warn!("background reindex worker disconnected");
+                    app.show_toast("index update failed");
+                }
+            }
+        }
 
         if !event::poll(Duration::from_millis(100))? {
             continue;
@@ -148,26 +258,177 @@ fn run_event_loop(
                     KeyCode::PageUp => app.page_up(),
                     KeyCode::PageDown => app.page_down(),
                     _ => {
-                        if matches!(key.code, KeyCode::Backspace)
-                            && app.remove_seeded_chip_at_cursor_start()
-                        {
-                            continue;
-                        }
-                        if app.composer.handle_key(key) {
-                            app.refresh_filters();
+                        if app.handle_composer_key(key) {
+                            maybe_requery_filtered_sessions(index, app)?;
+                            maybe_load_message_bodies(index, app)?;
                         }
                     }
                 }
             }
             Event::Paste(text)
-                if app.fork_picker().is_none() && app.composer.insert_paste(&text) =>
+                if app.fork_picker().is_none() && app.insert_composer_paste(&text) =>
             {
-                app.refresh_filters();
+                maybe_requery_filtered_sessions(index, app)?;
+                maybe_load_message_bodies(index, app)?;
             }
             Event::Resize(_, _) => {}
             _ => {}
         }
     }
+}
+
+fn draw_benchmark_frame(app: &mut App, startup_started: Instant) -> Result<Duration> {
+    if io::stdout().is_terminal() {
+        let mut terminal = TerminalGuard::enter()?;
+        let render_result = draw_first_frame(terminal.terminal_mut(), app);
+        let elapsed = startup_started.elapsed();
+        log_first_render_for_benchmark(render_result.is_ok(), elapsed);
+        render_result?;
+        terminal.restore()?;
+        Ok(elapsed)
+    } else {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).context("failed to initialize test terminal")?;
+        let render_result = draw_first_frame(&mut terminal, app);
+        let elapsed = startup_started.elapsed();
+        log_first_render_for_benchmark(render_result.is_ok(), elapsed);
+        render_result?;
+        Ok(elapsed)
+    }
+}
+
+fn draw_first_frame<B>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()>
+where
+    B: Backend,
+    B::Error: std::fmt::Debug,
+{
+    terminal
+        .draw(|frame| render::render(frame, app))
+        .map_err(|error| anyhow::anyhow!("failed to draw first TUI frame: {error:?}"))?;
+    Ok(())
+}
+
+fn log_first_render_for_benchmark(ok: bool, elapsed: Duration) {
+    let span = info_span!("asm.first_render");
+    let _enter = span.enter();
+    info!(
+        elapsed_ms = elapsed.as_millis(),
+        ok, "startup phase complete"
+    );
+    let span = info_span!("asm.startup");
+    let _enter = span.enter();
+    info!(elapsed_ms = elapsed.as_millis(), "first frame drawn");
+}
+
+fn elapsed_ms(started: Instant) -> u128 {
+    started.elapsed().as_millis()
+}
+
+fn maybe_reindex_on_startup(
+    index: &mut Index,
+    claude_root: &Path,
+    codex_root: &Path,
+) -> Result<StartupReindex> {
+    if let Some(cache_age) = index.last_reindex_age()? {
+        if cache_age < RECENT_REINDEX_THRESHOLD {
+            info!(
+                cache_age_secs = cache_age.as_secs(),
+                threshold_secs = RECENT_REINDEX_THRESHOLD.as_secs(),
+                "reindex skipped"
+            );
+            return Ok(StartupReindex::Complete(None));
+        }
+
+        info!(
+            cache_age_secs = cache_age.as_secs(),
+            threshold_secs = RECENT_REINDEX_THRESHOLD.as_secs(),
+            "reindex deferred until after first render"
+        );
+        return Ok(StartupReindex::Deferred(DeferredReindex {
+            claude_root: claude_root.to_path_buf(),
+            codex_root: codex_root.to_path_buf(),
+        }));
+    }
+
+    let stats = reindex_all(index, claude_root, codex_root)?;
+    info!(
+        discovered = stats.discovered,
+        parsed = stats.parsed,
+        skipped_unchanged = stats.skipped_unchanged,
+        failed = stats.failed,
+        "initial TUI reindex complete"
+    );
+    Ok(StartupReindex::Complete(Some(stats)))
+}
+
+fn start_background_reindex(deferred: DeferredReindex) -> BackgroundReindexReceiver {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| {
+            let mut index = Index::open()?;
+            reindex_all(&mut index, &deferred.claude_root, &deferred.codex_root)
+        })()
+        .map_err(|error| error.to_string());
+        let _ = sender.send(BackgroundReindexComplete { result });
+    });
+    receiver
+}
+
+fn handle_background_reindex_complete(
+    complete: BackgroundReindexComplete,
+    index: &mut Index,
+    app: &mut App,
+) -> Result<()> {
+    match complete.result {
+        Ok(stats) => {
+            info!(
+                discovered = stats.discovered,
+                parsed = stats.parsed,
+                skipped_unchanged = stats.skipped_unchanged,
+                failed = stats.failed,
+                "background TUI reindex complete"
+            );
+            let sessions = index.list_filtered(app.chips())?;
+            if app.message_bodies_loaded() {
+                app.set_sessions_and_bodies(sessions, index.dump_message_bodies()?);
+            } else {
+                app.set_sessions(sessions);
+            }
+            app.record_reindex(stats);
+        }
+        Err(error) => {
+            warn!(%error, "background TUI reindex failed");
+            app.show_toast("index update failed");
+        }
+    }
+    Ok(())
+}
+
+fn maybe_load_message_bodies(index: &Index, app: &mut App) -> Result<()> {
+    if !app.needs_message_bodies() {
+        return Ok(());
+    }
+
+    let message_bodies = index.dump_message_bodies()?;
+    let body_session_count = message_bodies.len();
+    app.set_message_bodies(message_bodies);
+    info!(body_session_count, "lazy message bodies loaded for search");
+    Ok(())
+}
+
+fn maybe_requery_filtered_sessions(index: &Index, app: &mut App) -> Result<()> {
+    if !app.take_pushdown_filter_dirty() {
+        return Ok(());
+    }
+
+    let chips = app.chips().to_vec();
+    let sessions = index.list_filtered(&chips)?;
+    if app.message_bodies_loaded() {
+        app.set_sessions_and_bodies(sessions, index.dump_message_bodies()?);
+    } else {
+        app.set_sessions(sessions);
+    }
+    Ok(())
 }
 
 fn refresh_index(
@@ -184,7 +445,12 @@ fn refresh_index(
         failed = stats.failed,
         "inline TUI reindex complete"
     );
-    app.set_sessions_and_bodies(index.list_all()?, index.dump_message_bodies()?);
+    let sessions = index.list_filtered(app.chips())?;
+    if app.message_bodies_loaded() {
+        app.set_sessions_and_bodies(sessions, index.dump_message_bodies()?);
+    } else {
+        app.set_sessions(sessions);
+    }
     app.record_reindex(stats);
     Ok(())
 }

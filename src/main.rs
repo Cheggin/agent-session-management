@@ -1,8 +1,12 @@
-use std::path::PathBuf;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 use anyhow::{Context, Result};
 use asm::{
-    cli::parse_filter_arg,
+    cli::parse_list_filter_chips,
     db::Index,
     export::{export_session, export_session_to_path},
     fork::{end_cut_index, fork_session},
@@ -12,7 +16,7 @@ use asm::{
     ui::{self, filter::Chip},
 };
 use clap::{Parser as ClapParser, Subcommand};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, ClapParser)]
 #[command(name = "asm", version, about = "Agent Session Manager")]
@@ -20,6 +24,12 @@ struct Cli {
     /// Seed the list with filter chips, e.g. --filter "claude branch:main".
     #[arg(long, value_name = "expr")]
     filter: Option<String>,
+    /// Show sessions across all directories instead of starting with @here.
+    #[arg(long)]
+    global: bool,
+    /// Draw the first TUI frame, print startup wall-clock timing, then exit.
+    #[arg(long)]
+    benchmark: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -37,6 +47,9 @@ enum Command {
         /// Seed the list with filter chips, e.g. --filter "claude branch:main".
         #[arg(long, value_name = "expr")]
         filter: Option<String>,
+        /// Show sessions across all directories instead of starting with @here.
+        #[arg(long)]
+        global: bool,
     },
     /// Resume a session by id (ships in Step 6).
     Resume { id: String },
@@ -61,11 +74,35 @@ enum Command {
 }
 
 fn main() -> Result<()> {
-    init_tracing();
-
+    let startup_started = Instant::now();
     let cli = Cli::parse();
+    let tracing_init_started = Instant::now();
+    let _file_tracing_guard = if is_tui_command(&cli.command) {
+        Some(init_file_tracing(&default_tui_log_path()?)?)
+    } else {
+        init_stderr_tracing()?;
+        None
+    };
+    {
+        let span = tracing::info_span!("asm.tracing_init");
+        let _enter = span.enter();
+        tracing::info!(
+            elapsed_ms = elapsed_ms(tracing_init_started),
+            "startup phase complete"
+        );
+    }
+    reject_global_for_non_list(cli.global, &cli.command);
+    reject_benchmark_for_non_list(cli.benchmark, &cli.command);
+
     match cli.command {
-        None => ui::run_with_filter(parse_filter_or_exit(cli.filter.as_deref())?)?,
+        None => {
+            let chips = parse_list_filter_or_exit(cli.filter.as_deref(), cli.global)?;
+            if cli.benchmark {
+                ui::run_benchmark_with_filter_started(chips, startup_started)?
+            } else {
+                ui::run_with_filter_started(chips, startup_started)?
+            }
+        }
         Some(Command::Reindex) => {
             reject_filter_for_non_list(cli.filter.as_deref());
             let (claude_root, codex_root) = default_agent_roots()?;
@@ -86,9 +123,14 @@ fn main() -> Result<()> {
             let report = uninstall_zsh()?;
             print_uninstall_report(&report);
         }
-        Some(Command::Ls { filter }) => {
+        Some(Command::Ls { filter, global }) => {
             let filter = filter.as_deref().or(cli.filter.as_deref());
-            ui::run_with_filter(parse_filter_or_exit(filter)?)?
+            let chips = parse_list_filter_or_exit(filter, cli.global || global)?;
+            if cli.benchmark {
+                ui::run_benchmark_with_filter_started(chips, startup_started)?
+            } else {
+                ui::run_with_filter_started(chips, startup_started)?
+            }
         }
         Some(Command::Resume { id }) => {
             reject_filter_for_non_list(cli.filter.as_deref());
@@ -144,6 +186,14 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn elapsed_ms(started: Instant) -> u128 {
+    started.elapsed().as_millis()
+}
+
+fn is_tui_command(command: &Option<Command>) -> bool {
+    matches!(command, None | Some(Command::Ls { .. }))
+}
+
 fn reject_filter_for_non_list(filter: Option<&str>) {
     if filter.is_some() {
         eprintln!("--filter is only supported by `asm` and `asm ls`");
@@ -151,12 +201,23 @@ fn reject_filter_for_non_list(filter: Option<&str>) {
     }
 }
 
-fn parse_filter_or_exit(filter: Option<&str>) -> Result<Vec<Chip>> {
-    let Some(filter) = filter else {
-        return Ok(Vec::new());
-    };
+fn reject_global_for_non_list(global: bool, command: &Option<Command>) {
+    if global && !is_tui_command(command) {
+        eprintln!("--global is only supported by `asm` and `asm ls`");
+        std::process::exit(2);
+    }
+}
+
+fn reject_benchmark_for_non_list(benchmark: bool, command: &Option<Command>) {
+    if benchmark && !is_tui_command(command) {
+        eprintln!("--benchmark is only supported by `asm` and `asm ls`");
+        std::process::exit(2);
+    }
+}
+
+fn parse_list_filter_or_exit(filter: Option<&str>, global: bool) -> Result<Vec<Chip>> {
     let current_cwd = std::env::current_dir().context("failed to read current directory")?;
-    match parse_filter_arg(filter, &current_cwd) {
+    match parse_list_filter_chips(filter, &current_cwd, global) {
         Ok(chips) => Ok(chips),
         Err(error) => {
             eprintln!("{error}");
@@ -165,12 +226,47 @@ fn parse_filter_or_exit(filter: Option<&str>) -> Result<Vec<Chip>> {
     }
 }
 
-fn init_tracing() {
+fn init_stderr_tracing() -> Result<()> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
+    let layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_target(false);
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(layer)
+        .try_init()
+        .context("failed to initialize stderr tracing")
+}
+
+fn init_file_tracing(log_path: &Path) -> Result<tracing_appender::non_blocking::WorkerGuard> {
+    let parent = log_path
+        .parent()
+        .context("asm log path must include a parent directory")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create asm log directory {}", parent.display()))?;
+    let file_name = log_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("asm log path must include a valid UTF-8 file name")?;
+    let file_appender = tracing_appender::rolling::never(parent, file_name);
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let layer = tracing_subscriber::fmt::layer()
+        .with_writer(non_blocking)
+        .with_ansi(false)
         .with_target(false)
-        .init();
+        .compact();
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(layer)
+        .try_init()
+        .context("failed to initialize file tracing")?;
+    Ok(guard)
+}
+
+fn default_tui_log_path() -> Result<PathBuf> {
+    let home = dirs::home_dir().context("could not determine home directory")?;
+    Ok(home.join(".config").join("asm").join("asm.log"))
 }
 
 fn default_agent_roots() -> Result<(PathBuf, PathBuf)> {

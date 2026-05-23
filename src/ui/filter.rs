@@ -10,7 +10,7 @@ use nucleo_matcher::{
     pattern::{CaseMatching, Normalization, Pattern},
 };
 
-use crate::{Agent, Session};
+use crate::{Agent, Entrypoint, Session};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Chip {
@@ -64,7 +64,14 @@ pub fn apply_filters_with_haystacks(
 
     let mut indices = Vec::new();
     for (idx, session) in sessions.iter().enumerate() {
-        if session.is_sidechain || session.user_msg_count == 0 {
+        // Drop non-interactive automation sessions from the default session list.
+        if session.is_sidechain
+            || session.user_msg_count == 0
+            || matches!(
+                session.entrypoint.as_ref(),
+                Some(Entrypoint::Sdk | Entrypoint::Exec)
+            )
+        {
             continue;
         }
         if !chips.iter().all(|chip| matches_chip(session, chip)) {
@@ -96,10 +103,22 @@ pub fn build_session_haystacks(
     sessions: &[Session],
     message_bodies: &HashMap<String, String>,
 ) -> Vec<String> {
+    build_session_haystacks_optional(sessions, Some(message_bodies))
+}
+
+pub(crate) fn build_session_haystacks_optional(
+    sessions: &[Session],
+    message_bodies: Option<&HashMap<String, String>>,
+) -> Vec<String> {
     sessions
         .iter()
         .map(|session| {
-            session_haystack(session, message_bodies.get(&session.id).map(String::as_str))
+            session_haystack(
+                session,
+                message_bodies
+                    .and_then(|bodies| bodies.get(&session.id))
+                    .map(String::as_str),
+            )
         })
         .collect()
 }
@@ -118,7 +137,14 @@ pub fn chip_label(chip: &Chip) -> String {
     }
 }
 
-fn parse_chip(token: &str, current_cwd: &Path) -> Option<Chip> {
+pub(crate) fn is_sql_pushdown_chip(chip: &Chip) -> bool {
+    matches!(
+        chip,
+        Chip::HereCwd(_) | Chip::Agent(_) | Chip::Branch(_) | Chip::PathSubstring(_)
+    )
+}
+
+pub(crate) fn parse_chip(token: &str, current_cwd: &Path) -> Option<Chip> {
     match token {
         "@claude" => Some(Chip::Agent(Agent::Claude)),
         "@codex" => Some(Chip::Agent(Agent::Codex)),
