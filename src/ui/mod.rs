@@ -8,6 +8,7 @@ mod sparkline;
 mod theme;
 
 use std::{
+    collections::HashSet,
     io::{self, IsTerminal, Stdout},
     path::{Path, PathBuf},
     sync::mpsc,
@@ -54,6 +55,7 @@ struct BackgroundReindexComplete {
 }
 
 type BackgroundReindexReceiver = mpsc::Receiver<BackgroundReindexComplete>;
+type LiveSessionReceiver = mpsc::Receiver<HashSet<String>>;
 
 enum StartupReindex {
     Complete(Option<crate::reindex::ReindexStats>),
@@ -189,15 +191,20 @@ fn run_event_loop(
                 elapsed_ms = elapsed_ms(startup_started),
                 "first frame drawn"
             );
+            start_live_session_scan(app);
             if let Some(deferred) = deferred_reindex.take() {
                 background_reindex = Some(start_background_reindex(deferred));
             }
         }
 
+        let mut needs_redraw = false;
         if let Some(receiver) = background_reindex.take() {
             match receiver.try_recv() {
                 Ok(complete) => {
-                    handle_background_reindex_complete(complete, index, app)?;
+                    if handle_background_reindex_complete(complete, index, app)? {
+                        start_live_session_scan(app);
+                    }
+                    needs_redraw = true;
                 }
                 Err(mpsc::TryRecvError::Empty) => {
                     background_reindex = Some(receiver);
@@ -205,11 +212,25 @@ fn run_event_loop(
                 Err(mpsc::TryRecvError::Disconnected) => {
                     warn!("background reindex worker disconnected");
                     app.show_toast("index update failed");
+                    needs_redraw = true;
                 }
             }
         }
 
-        if !event::poll(Duration::from_millis(100))? {
+        if poll_live_session_scan(app) {
+            needs_redraw = true;
+        }
+
+        if needs_redraw {
+            continue;
+        }
+
+        let event_poll_timeout = if app.live_rx.is_some() {
+            Duration::from_millis(16)
+        } else {
+            Duration::from_millis(100)
+        };
+        if !event::poll(event_poll_timeout)? {
             continue;
         }
 
@@ -237,6 +258,7 @@ fn run_event_loop(
                 }
                 if should_reindex(key) {
                     refresh_index(index, claude_root, codex_root, app)?;
+                    start_live_session_scan(app);
                     continue;
                 }
                 if should_fork(key) {
@@ -259,7 +281,9 @@ fn run_event_loop(
                     KeyCode::PageDown => app.page_down(),
                     _ => {
                         if app.handle_composer_key(key) {
-                            maybe_requery_filtered_sessions(index, app)?;
+                            if maybe_requery_filtered_sessions(index, app)? {
+                                start_live_session_scan(app);
+                            }
                             maybe_load_message_bodies(index, app)?;
                         }
                     }
@@ -268,7 +292,9 @@ fn run_event_loop(
             Event::Paste(text)
                 if app.fork_picker().is_none() && app.insert_composer_paste(&text) =>
             {
-                maybe_requery_filtered_sessions(index, app)?;
+                if maybe_requery_filtered_sessions(index, app)? {
+                    start_live_session_scan(app);
+                }
                 maybe_load_message_bodies(index, app)?;
             }
             Event::Resize(_, _) => {}
@@ -374,11 +400,41 @@ fn start_background_reindex(deferred: DeferredReindex) -> BackgroundReindexRecei
     receiver
 }
 
+fn start_live_session_scan(app: &mut App) {
+    let (sender, receiver): (mpsc::Sender<HashSet<String>>, LiveSessionReceiver) = mpsc::channel();
+    app.live_rx = Some(receiver);
+    std::thread::spawn(move || {
+        let live_ids = crate::liveness::live_session_ids();
+        let _ = sender.send(live_ids);
+    });
+}
+
+fn poll_live_session_scan(app: &mut App) -> bool {
+    let Some(receiver) = app.live_rx.take() else {
+        return false;
+    };
+
+    match receiver.try_recv() {
+        Ok(live_ids) => {
+            app.apply_live_session_ids(&live_ids);
+            true
+        }
+        Err(mpsc::TryRecvError::Empty) => {
+            app.live_rx = Some(receiver);
+            false
+        }
+        Err(mpsc::TryRecvError::Disconnected) => {
+            warn!("background liveness worker disconnected");
+            false
+        }
+    }
+}
+
 fn handle_background_reindex_complete(
     complete: BackgroundReindexComplete,
     index: &mut Index,
     app: &mut App,
-) -> Result<()> {
+) -> Result<bool> {
     match complete.result {
         Ok(stats) => {
             info!(
@@ -395,13 +451,14 @@ fn handle_background_reindex_complete(
                 app.set_sessions(sessions);
             }
             app.record_reindex(stats);
+            Ok(true)
         }
         Err(error) => {
             warn!(%error, "background TUI reindex failed");
             app.show_toast("index update failed");
+            Ok(false)
         }
     }
-    Ok(())
 }
 
 fn maybe_load_message_bodies(index: &Index, app: &mut App) -> Result<()> {
@@ -416,9 +473,9 @@ fn maybe_load_message_bodies(index: &Index, app: &mut App) -> Result<()> {
     Ok(())
 }
 
-fn maybe_requery_filtered_sessions(index: &Index, app: &mut App) -> Result<()> {
+fn maybe_requery_filtered_sessions(index: &Index, app: &mut App) -> Result<bool> {
     if !app.take_pushdown_filter_dirty() {
-        return Ok(());
+        return Ok(false);
     }
 
     let chips = app.chips().to_vec();
@@ -428,7 +485,7 @@ fn maybe_requery_filtered_sessions(index: &Index, app: &mut App) -> Result<()> {
     } else {
         app.set_sessions(sessions);
     }
-    Ok(())
+    Ok(true)
 }
 
 fn refresh_index(

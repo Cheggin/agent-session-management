@@ -1,14 +1,14 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, mpsc::Receiver},
     time::{Duration as StdDuration, Instant},
 };
 
 use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::{Session, liveness::mark_live_sessions, reindex::ReindexStats};
+use crate::{Session, reindex::ReindexStats};
 
 use super::{
     composer::Composer,
@@ -36,6 +36,7 @@ pub struct App {
     live_chips: Vec<Chip>,
     pushdown_filter_dirty: bool,
     toast: Option<Toast>,
+    pub(crate) live_rx: Option<Receiver<HashSet<String>>>,
 }
 
 #[derive(Debug)]
@@ -78,7 +79,7 @@ impl App {
         message_bodies: Option<Arc<HashMap<String, String>>>,
     ) -> Self {
         let current_cwd = current_cwd.canonicalize().unwrap_or(current_cwd);
-        mark_live_sessions(&mut sessions);
+        clear_live_sessions(&mut sessions);
         let session_haystacks =
             build_session_haystacks_optional(&sessions, message_bodies.as_deref());
         let mut app = Self {
@@ -100,13 +101,14 @@ impl App {
             live_chips: Vec::new(),
             pushdown_filter_dirty: false,
             toast: None,
+            live_rx: None,
         };
         app.refresh_filters();
         app
     }
 
     pub fn set_sessions(&mut self, mut sessions: Vec<Session>) {
-        mark_live_sessions(&mut sessions);
+        clear_live_sessions(&mut sessions);
         self.session_haystacks =
             build_session_haystacks_optional(&sessions, self.message_bodies.as_deref());
         self.sessions = sessions;
@@ -118,7 +120,7 @@ impl App {
         mut sessions: Vec<Session>,
         message_bodies: HashMap<String, String>,
     ) {
-        mark_live_sessions(&mut sessions);
+        clear_live_sessions(&mut sessions);
         self.message_bodies = Some(Arc::new(message_bodies));
         self.session_haystacks =
             build_session_haystacks_optional(&sessions, self.message_bodies.as_deref());
@@ -294,6 +296,13 @@ impl App {
         self.filtered_indices.len()
     }
 
+    pub(crate) fn apply_live_session_ids(&mut self, live_ids: &HashSet<String>) {
+        for session in &mut self.sessions {
+            session.is_live = live_ids.contains(&session.id);
+        }
+        self.refresh_filters();
+    }
+
     pub fn selected_session(&self) -> Option<&Session> {
         self.filtered_indices
             .get(self.selected)
@@ -455,4 +464,10 @@ fn find_completed_chip(input: &str, current_cwd: &Path) -> Option<(usize, usize,
 
 fn normalize_search_text(input: &str) -> String {
     input.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn clear_live_sessions(sessions: &mut [Session]) {
+    for session in sessions {
+        session.is_live = false;
+    }
 }

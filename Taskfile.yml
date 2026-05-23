@@ -54,9 +54,10 @@ tasks:
       - cargo fmt --all -- --check
 
   up:
-    desc: Quick dev run (release build, launch asm)
+    desc: Launch installed asm (build + install, then exec the binary)
     cmds:
-      - cargo run --release -- {{.CLI_ARGS}}
+      - cargo install --path . --quiet
+      - exec asm {{.CLI_ARGS}}
 
   bench:
     desc: End-to-end wall-clock startup
