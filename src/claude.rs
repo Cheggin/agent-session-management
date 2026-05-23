@@ -33,7 +33,11 @@ impl ClaudeParser {
             };
 
             match event.get("type").and_then(Value::as_str) {
-                Some("user") if !is_meta(&event) => bodies.extend(user_text_bodies(&event)),
+                Some("user") if !is_meta(&event) => bodies.extend(
+                    user_text_bodies(&event)
+                        .into_iter()
+                        .filter(|t| !is_system_noise(t)),
+                ),
                 Some("assistant") => bodies.extend(assistant_text_bodies(&event)),
                 _ => {}
             }
@@ -61,6 +65,7 @@ impl Parser for ClaudeParser {
         let mut entrypoint: Option<Entrypoint> = None;
         let mut title: Option<String> = None;
         let mut first_user_prompt: Option<String> = None;
+        let mut recent_user_prompts = Vec::new();
         let mut last_assistant_text: Option<String> = None;
         let mut started_at: Option<DateTime<Utc>> = None;
         let mut last_user_msg_at: Option<DateTime<Utc>> = None;
@@ -128,10 +133,15 @@ impl Parser for ClaudeParser {
                         continue;
                     };
 
+                    if is_system_noise(&prompt) {
+                        continue;
+                    }
+
                     user_msg_count += 1;
                     if first_user_prompt.is_none() {
-                        first_user_prompt = Some(prompt);
+                        first_user_prompt = Some(prompt.clone());
                     }
+                    remember_recent_user_prompt(&mut recent_user_prompts, prompt);
                     if let Some(timestamp) = timestamp {
                         last_user_msg_at = Some(timestamp);
                     }
@@ -164,6 +174,7 @@ impl Parser for ClaudeParser {
             entrypoint,
             title: title.or_else(|| first_user_prompt.clone()),
             first_user_prompt,
+            recent_user_prompts,
             last_assistant_text,
             started_at,
             last_user_msg_at,
@@ -246,4 +257,28 @@ fn assistant_text_bodies(event: &Value) -> Vec<String> {
 fn nonempty_trimmed(text: &str) -> Option<String> {
     let text = text.trim();
     (!text.is_empty()).then(|| text.to_owned())
+}
+
+/// Harness-injected messages get recorded with `type: "user"` but aren't real
+/// prompts (task-notifications, system-reminders, command stubs, etc.). Filter
+/// them out when extracting prompts for display.
+fn is_system_noise(text: &str) -> bool {
+    let t = text.trim_start();
+    t.starts_with("<task-notification>")
+        || t.starts_with("<system-reminder>")
+        || t.starts_with("<command-name>")
+        || t.starts_with("<command-message>")
+        || t.starts_with("<command-args>")
+        || t.starts_with("<local-command-stdout>")
+        || t.starts_with("<local-command-stderr>")
+        || t.starts_with("<bash-input>")
+        || t.starts_with("<bash-stdout>")
+        || t.starts_with("<bash-stderr>")
+}
+
+fn remember_recent_user_prompt(recent_user_prompts: &mut Vec<String>, prompt: String) {
+    recent_user_prompts.push(prompt);
+    if recent_user_prompts.len() > 3 {
+        recent_user_prompts.remove(0);
+    }
 }

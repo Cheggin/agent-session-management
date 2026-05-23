@@ -22,6 +22,7 @@ fn sqlite_index_round_trips_all_session_fields() {
         Some(123_456_789)
     );
     let sessions = index.list_all().unwrap();
+    assert_eq!(sessions[0].recent_user_prompts, session.recent_user_prompts);
     assert_eq!(sessions, vec![session]);
 }
 

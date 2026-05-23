@@ -8,11 +8,11 @@ use std::{
 use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::{liveness::mark_live_sessions, reindex::ReindexStats, Session};
+use crate::{Session, liveness::mark_live_sessions, reindex::ReindexStats};
 
 use super::{
     composer::Composer,
-    filter::{apply_filters_with_haystacks, build_session_haystacks_optional, parse_chip, Chip},
+    filter::{Chip, apply_filters_with_haystacks, build_session_haystacks_optional, parse_chip},
     fork_picker::ForkPicker,
 };
 

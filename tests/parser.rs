@@ -12,6 +12,7 @@ struct ExpectedSession {
     entrypoint: Option<Entrypoint>,
     title: Option<&'static str>,
     first_user_prompt: Option<&'static str>,
+    recent_user_prompts: &'static [&'static str],
     last_assistant_text: Option<&'static str>,
     started_at: &'static str,
     last_user_msg_at: Option<&'static str>,
@@ -42,6 +43,14 @@ fn assert_session(session: Session, expected: ExpectedSession) {
     assert_eq!(
         session.first_user_prompt,
         expected.first_user_prompt.map(String::from)
+    );
+    assert_eq!(
+        session.recent_user_prompts,
+        expected
+            .recent_user_prompts
+            .iter()
+            .map(|prompt| (*prompt).to_owned())
+            .collect::<Vec<_>>()
     );
     assert_eq!(
         session.last_assistant_text,
@@ -79,6 +88,9 @@ fn parses_claude_ai_title_session() {
             first_user_prompt: Some(
                 "how much of the github storage are we using right now for this repo",
             ),
+            recent_user_prompts: &[
+                "how much of the github storage are we using right now for this repo",
+            ],
             last_assistant_text: Some(
                 "**browser-use/desktop** is using **16,432 KB (~16 MB / ~0.016 GB)** of GitHub storage.\n\nFor reference, GitHub's soft limit is 1 GB per repo — you're at ~1.6% of that.",
             ),
@@ -108,6 +120,7 @@ fn parses_claude_first_prompt_title_fallback_session() {
             entrypoint: Some(Entrypoint::Sdk),
             title: Some("Reply with exactly the word OK and nothing else."),
             first_user_prompt: Some("Reply with exactly the word OK and nothing else."),
+            recent_user_prompts: &["Reply with exactly the word OK and nothing else."],
             last_assistant_text: Some("OK"),
             started_at: "2026-05-12T01:43:20.487Z",
             last_user_msg_at: Some("2026-05-12T01:43:20.493Z"),
@@ -137,6 +150,7 @@ fn parses_codex_tui_session() {
             entrypoint: Some(Entrypoint::Tui),
             title: Some("gh issue view 52 then fix it"),
             first_user_prompt: Some("gh issue view 52 then fix it"),
+            recent_user_prompts: &["gh issue view 52 then fix it"],
             last_assistant_text: Some(
                 "I’m pulling the issue details first, then I’ll inspect the codebase around the affected area and implement the fix directly in this workspace.",
             ),
@@ -168,6 +182,7 @@ fn parses_codex_exec_session() {
             entrypoint: Some(Entrypoint::Exec),
             title: Some("say hello in 5 words"),
             first_user_prompt: Some("say hello in 5 words"),
+            recent_user_prompts: &["say hello in 5 words"],
             last_assistant_text: Some("Hello there, wishing you well."),
             started_at: "2026-04-22T21:54:46.184Z",
             last_user_msg_at: Some("2026-04-22T21:54:52.028Z"),

@@ -170,3 +170,23 @@ The median full-process wall clock stayed at the coarse `/usr/bin/time` floor of
 - `cargo clippy --all-targets -- -D warnings` passed.
 - `task bench` passed via `/usr/bin/time` fallback on this machine.
 - `/usr/bin/time -p task up -- --benchmark` passed and printed `asm benchmark: 26ms`.
+
+## Round 3b: build profile + responsive preview + recent prompts
+
+Date: 2026-05-23
+Method: release build once, then run `/usr/bin/time -p target/release/asm --benchmark` five times. These runs used the prebuilt `target/release/asm` binary.
+
+### End-to-end wall-clock timings
+
+| command | `asm benchmark` runs (ms) | median `asm benchmark` | `/usr/bin/time real` runs (s) | median `real` |
+| --- | ---: | ---: | ---: | ---: |
+| `/usr/bin/time -p target/release/asm --benchmark` | 15, 14, 14, 14, 14 | 14ms | 0.20, 0.01, 0.01, 0.01, 0.01 | 0.01s |
+
+The median process-internal benchmark stayed at the current 14ms baseline; the coarse end-to-end `/usr/bin/time real` median was 0.01s.
+
+### Validation
+
+- `cargo build --release` passed.
+- `cargo test` passed: 59 tests.
+- `cargo clippy --all-targets -- -D warnings` passed.
+- `cargo fmt --all -- --check` passed.

@@ -130,6 +130,7 @@ mod tests {
             entrypoint: None,
             title: None,
             first_user_prompt: None,
+            recent_user_prompts: Vec::new(),
             last_assistant_text: None,
             started_at: at,
             last_user_msg_at: None,

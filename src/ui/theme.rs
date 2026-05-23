@@ -73,6 +73,10 @@ pub fn branch() -> Style {
 }
 
 pub fn chip() -> Style {
+    Style::default().fg(accent_color())
+}
+
+pub fn chip_pending_delete() -> Style {
     Style::default()
         .fg(surface())
         .bg(accent_color())

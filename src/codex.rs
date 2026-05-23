@@ -108,6 +108,7 @@ impl Parser for CodexParser {
             .is_some_and(|thread_source| thread_source == "subagent");
 
         let mut first_user_prompt: Option<String> = None;
+        let mut recent_user_prompts = Vec::new();
         let mut last_agent_message: Option<String> = None;
         let mut last_task_complete_message: Option<String> = None;
         let mut last_user_msg_at: Option<DateTime<Utc>> = None;
@@ -144,6 +145,13 @@ impl Parser for CodexParser {
                     {
                         first_user_prompt = Some(message.trim().to_owned());
                     }
+                    if let Some(message) = payload
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .and_then(nonempty_trimmed)
+                    {
+                        remember_recent_user_prompt(&mut recent_user_prompts, message);
+                    }
                     if let Some(timestamp) = timestamp {
                         last_user_msg_at = Some(timestamp);
                     }
@@ -178,6 +186,7 @@ impl Parser for CodexParser {
             entrypoint,
             title: first_user_prompt.clone(),
             first_user_prompt,
+            recent_user_prompts,
             last_assistant_text: last_task_complete_message.or(last_agent_message),
             started_at,
             last_user_msg_at,
@@ -245,4 +254,11 @@ fn update_latest(latest: &mut Option<DateTime<Utc>>, timestamp: DateTime<Utc>) {
 fn nonempty_trimmed(text: &str) -> Option<String> {
     let text = text.trim();
     (!text.is_empty()).then(|| text.to_owned())
+}
+
+fn remember_recent_user_prompt(recent_user_prompts: &mut Vec<String>, prompt: String) {
+    recent_user_prompts.push(prompt);
+    if recent_user_prompts.len() > 3 {
+        recent_user_prompts.remove(0);
+    }
 }

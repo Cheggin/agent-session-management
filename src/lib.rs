@@ -52,6 +52,7 @@ pub struct Session {
     // display
     pub title: Option<String>,
     pub first_user_prompt: Option<String>,
+    pub recent_user_prompts: Vec<String>,
     pub last_assistant_text: Option<String>,
 
     // timing

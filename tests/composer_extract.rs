@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use asm::{
-    ui::{filter::Chip, App},
     Agent,
+    ui::{App, filter::Chip},
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 

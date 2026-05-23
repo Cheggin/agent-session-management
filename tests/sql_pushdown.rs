@@ -101,6 +101,7 @@ fn session(id: &str, agent: Agent, cwd: &str, branch: &str, entrypoint: Entrypoi
         entrypoint: Some(entrypoint),
         title: Some(id.to_owned()),
         first_user_prompt: Some(format!("prompt {id}")),
+        recent_user_prompts: vec![format!("prompt {id}")],
         last_assistant_text: None,
         started_at: timestamp,
         last_user_msg_at: Some(timestamp),

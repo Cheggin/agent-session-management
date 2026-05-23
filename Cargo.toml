@@ -9,6 +9,7 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 dirs = "5"
+mimalloc = { version = "0.1", default-features = false }
 nucleo-matcher = "0.3"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
 rayon = "1"
@@ -26,3 +27,9 @@ walkdir = "2"
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

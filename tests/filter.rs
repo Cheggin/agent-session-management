@@ -183,6 +183,7 @@ fn session(id: &str, agent: Agent, minute: u32) -> Session {
         entrypoint: None,
         title: Some(id.to_owned()),
         first_user_prompt: Some(format!("prompt {id}")),
+        recent_user_prompts: vec![format!("prompt {id}")],
         last_assistant_text: None,
         started_at: parse_utc("2026-05-22T12:00:00Z"),
         last_user_msg_at: Some(last_user),

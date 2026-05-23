@@ -2,11 +2,11 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use ratatui::{
+    Frame,
     layout::{Constraint, Direction, Layout, Margin, Position, Rect},
     style::Modifier,
     text::{Line, Span},
-    widgets::{Block, Borders, Padding, Paragraph},
-    Frame,
+    widgets::{Block, Borders, Padding, Paragraph, Wrap},
 };
 
 use crate::{Agent, Session};
@@ -54,7 +54,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
     render_input(frame, rows[row_idx], app);
     row_idx += 2;
-    render_middle(frame, rows[row_idx], app);
+    render_middle(frame, rows[row_idx], app, should_show_preview(full));
     row_idx += 2;
     render_hint(frame, rows[row_idx], app.toast_text());
 
@@ -71,7 +71,7 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
     for (idx, chip) in app.chips().iter().enumerate() {
         let label = format!("[{}]", chip_label(chip));
         let style = if app.chip_delete_pending == Some(idx) {
-            theme::chip().add_modifier(Modifier::REVERSED)
+            theme::chip_pending_delete()
         } else {
             theme::chip()
         };
@@ -101,8 +101,21 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 }
 
-fn render_middle(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    render_list(frame, area, app);
+fn render_middle(frame: &mut Frame<'_>, area: Rect, app: &mut App, show_preview: bool) {
+    if show_preview {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+            .split(area);
+        render_list(frame, columns[0], app);
+        render_preview(frame, columns[1], app);
+    } else {
+        render_list(frame, area, app);
+    }
+}
+
+fn should_show_preview(area: Rect) -> bool {
+    area.width >= 100 && area.height >= 20
 }
 
 fn render_list(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -135,6 +148,48 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_preview(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::border())
+        .padding(Padding::new(2, 2, 1, 1))
+        .title(" preview ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines = Vec::new();
+    let Some(session) = selected_session(app) else {
+        lines.push(Line::from(Span::styled("(no user messages)", theme::dim())));
+        frame.render_widget(Paragraph::new(lines), inner);
+        return;
+    };
+
+    lines.push(Line::from(Span::styled(
+        session_title(session),
+        theme::text_style().add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    if session.recent_user_prompts.is_empty() {
+        lines.push(Line::from(Span::styled("(no user messages)", theme::dim())));
+    } else {
+        lines.extend(
+            session
+                .recent_user_prompts
+                .iter()
+                .rev()
+                .map(|prompt| Line::from(format!("› {prompt}"))),
+        );
+    }
+
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn selected_session(app: &App) -> Option<&Session> {
+    let idx = app.filtered_indices.get(app.selected).copied()?;
+    app.sessions.get(idx)
 }
 
 fn render_hint(frame: &mut Frame<'_>, area: Rect, toast: Option<&str>) {

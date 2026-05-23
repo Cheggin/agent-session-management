@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   entrypoint TEXT,
   title TEXT,
   first_user_prompt TEXT,
+  recent_user_prompts TEXT,
   last_assistant_text TEXT,
   started_at INTEGER,
   last_user_msg_at INTEGER,
@@ -73,13 +74,14 @@ INSERT INTO sessions (
   entrypoint,
   title,
   first_user_prompt,
+  recent_user_prompts,
   last_assistant_text,
   started_at,
   last_user_msg_at,
   last_assistant_msg_at,
   user_msg_count,
   is_sidechain
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
 ON CONFLICT(path) DO UPDATE SET
   id = excluded.id,
   agent = excluded.agent,
@@ -89,6 +91,7 @@ ON CONFLICT(path) DO UPDATE SET
   entrypoint = excluded.entrypoint,
   title = excluded.title,
   first_user_prompt = excluded.first_user_prompt,
+  recent_user_prompts = excluded.recent_user_prompts,
   last_assistant_text = excluded.last_assistant_text,
   started_at = excluded.started_at,
   last_user_msg_at = excluded.last_user_msg_at,
@@ -315,6 +318,7 @@ SELECT
   entrypoint,
   title,
   first_user_prompt,
+  recent_user_prompts,
   last_assistant_text,
   started_at,
   last_user_msg_at,
@@ -350,6 +354,7 @@ SELECT
   entrypoint,
   title,
   first_user_prompt,
+  recent_user_prompts,
   last_assistant_text,
   started_at,
   last_user_msg_at,
@@ -411,6 +416,22 @@ WHERE is_sidechain = 0
 
     fn migrate(&self) -> Result<()> {
         self.conn.execute_batch(SCHEMA)?;
+        self.ensure_recent_user_prompts_column()?;
+        Ok(())
+    }
+
+    fn ensure_recent_user_prompts_column(&self) -> Result<()> {
+        let exists: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = ?1",
+            params!["recent_user_prompts"],
+            |row| row.get(0),
+        )?;
+        if exists == 0 {
+            self.conn.execute(
+                "ALTER TABLE sessions ADD COLUMN recent_user_prompts TEXT",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -435,12 +456,13 @@ fn session_from_row(row: &Row<'_>) -> Result<Session> {
     let entrypoint_raw: Option<String> = row.get(5)?;
     let title: Option<String> = row.get(6)?;
     let first_user_prompt: Option<String> = row.get(7)?;
-    let last_assistant_text: Option<String> = row.get(8)?;
-    let started_raw: String = row.get(9)?;
-    let last_user_raw: Option<String> = row.get(10)?;
-    let last_assistant_raw: Option<String> = row.get(11)?;
-    let user_msg_count_raw: i64 = row.get(12)?;
-    let is_sidechain_raw: i64 = row.get(13)?;
+    let recent_user_prompts_raw: Option<String> = row.get(8)?;
+    let last_assistant_text: Option<String> = row.get(9)?;
+    let started_raw: String = row.get(10)?;
+    let last_user_raw: Option<String> = row.get(11)?;
+    let last_assistant_raw: Option<String> = row.get(12)?;
+    let user_msg_count_raw: i64 = row.get(13)?;
+    let is_sidechain_raw: i64 = row.get(14)?;
 
     Ok(Session {
         id: id.clone(),
@@ -456,6 +478,8 @@ fn session_from_row(row: &Row<'_>) -> Result<Session> {
             .with_context(|| format!("invalid entrypoint for session {id}"))?,
         title,
         first_user_prompt,
+        recent_user_prompts: decode_recent_user_prompts(recent_user_prompts_raw.as_deref())
+            .with_context(|| format!("invalid recent_user_prompts for session {id}"))?,
         last_assistant_text,
         started_at: decode_datetime(&started_raw)
             .with_context(|| format!("invalid started_at for session {id}"))?,
@@ -506,6 +530,7 @@ fn execute_upsert(
     let path = path_to_db(&session.path);
     let cwd = session.cwd.as_deref().map(path_to_db);
     let entrypoint = session.entrypoint.as_ref().map(encode_entrypoint);
+    let recent_user_prompts = encode_recent_user_prompts(&session.recent_user_prompts)?;
     let started_at = encode_datetime(&session.started_at)?;
     let last_user_msg_at = session
         .last_user_msg_at
@@ -528,6 +553,7 @@ fn execute_upsert(
         entrypoint,
         &session.title,
         &session.first_user_prompt,
+        recent_user_prompts,
         &session.last_assistant_text,
         started_at,
         last_user_msg_at,
@@ -580,6 +606,18 @@ fn encode_datetime(datetime: &DateTime<Utc>) -> Result<String> {
 fn decode_datetime(value: &str) -> Result<DateTime<Utc>> {
     serde_json::from_value(serde_json::Value::String(value.to_owned()))
         .with_context(|| format!("failed to parse RFC3339 datetime {value:?}"))
+}
+
+fn encode_recent_user_prompts(recent_user_prompts: &[String]) -> Result<String> {
+    serde_json::to_string(recent_user_prompts).context("failed to serialize recent_user_prompts")
+}
+
+fn decode_recent_user_prompts(value: Option<&str>) -> Result<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_str(value)
+        .with_context(|| format!("failed to parse recent_user_prompts JSON {value:?}"))
 }
 
 fn encode_agent(agent: &Agent) -> &'static str {

@@ -1,3 +1,7 @@
+#[cfg(not(test))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::{
     fs,
     path::{Path, PathBuf},

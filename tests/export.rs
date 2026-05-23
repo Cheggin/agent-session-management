@@ -65,6 +65,7 @@ fn session_literal(root: &Path) -> Session {
         entrypoint: Some(Entrypoint::Cli),
         title: Some("Ship export support".to_owned()),
         first_user_prompt: Some("Add markdown export with full first prompt.".to_owned()),
+        recent_user_prompts: vec!["Add markdown export with full first prompt.".to_owned()],
         last_assistant_text: Some("Implemented the exporter.".to_owned()),
         started_at: parse_utc("2026-05-22T12:00:00Z"),
         last_user_msg_at: Some(parse_utc("2026-05-22T12:10:00Z")),
