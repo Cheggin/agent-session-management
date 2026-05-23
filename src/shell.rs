@@ -23,6 +23,8 @@ codex() {
 "#;
 
 const ZSHRC_MARKER: &str = "# asm shell hooks (installed by `asm install`)";
+const ZSHRC_PATH_LINE: &str =
+    "[[ \":$PATH:\" != *\":$HOME/.cargo/bin:\"* ]] && export PATH=\"$HOME/.cargo/bin:$PATH\"";
 const ZSHRC_SOURCE_LINE: &str = "[[ -f ~/.asm/shell-hooks.zsh ]] && source ~/.asm/shell-hooks.zsh";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,12 +66,14 @@ pub fn install_zsh_at(home_dir: &Path) -> Result<InstallReport> {
 
     let zshrc_path = home_dir.join(".zshrc");
     let mut zshrc = read_optional_to_string(&zshrc_path)?;
-    let appended_source_line = !has_source_line(&zshrc);
-    if appended_source_line {
+    let appended_block = !has_marker(&zshrc);
+    if appended_block {
         if !zshrc.is_empty() && !zshrc.ends_with('\n') {
             zshrc.push('\n');
         }
         zshrc.push_str(ZSHRC_MARKER);
+        zshrc.push('\n');
+        zshrc.push_str(ZSHRC_PATH_LINE);
         zshrc.push('\n');
         zshrc.push_str(ZSHRC_SOURCE_LINE);
         zshrc.push('\n');
@@ -81,7 +85,7 @@ pub fn install_zsh_at(home_dir: &Path) -> Result<InstallReport> {
         hook_path,
         zshrc_path,
         wrote_hook: true,
-        appended_source_line,
+        appended_source_line: appended_block,
     })
 }
 
@@ -121,9 +125,9 @@ pub fn print_install_report(report: &InstallReport) {
         println!("wrote ~/.asm/shell-hooks.zsh");
     }
     if report.appended_source_line {
-        println!("appended source line to ~/.zshrc");
+        println!("appended managed block to ~/.zshrc (PATH + source line)");
     } else {
-        println!("source line already present in ~/.zshrc");
+        println!("managed block already present in ~/.zshrc");
     }
     println!("restart your shell or run: source ~/.zshrc");
 }
@@ -157,15 +161,15 @@ fn read_optional_to_string(path: &Path) -> Result<String> {
     }
 }
 
-fn has_source_line(zshrc: &str) -> bool {
-    zshrc.lines().any(|line| line.trim() == ZSHRC_SOURCE_LINE)
+fn has_marker(zshrc: &str) -> bool {
+    zshrc.lines().any(|line| line.trim() == ZSHRC_MARKER)
 }
 
 fn remove_managed_zshrc_lines(zshrc: &str, removed_source_line: &mut bool) -> String {
     let mut kept = Vec::new();
     for line in zshrc.lines() {
         match line.trim() {
-            ZSHRC_MARKER => {}
+            ZSHRC_MARKER | ZSHRC_PATH_LINE => {}
             ZSHRC_SOURCE_LINE => {
                 *removed_source_line = true;
             }
