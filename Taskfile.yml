@@ -53,6 +53,22 @@ tasks:
     cmds:
       - cargo fmt --all -- --check
 
+  up:
+    desc: Quick dev run (release build, launch asm)
+    cmds:
+      - cargo run --release -- {{.CLI_ARGS}}
+
+  bench:
+    desc: End-to-end wall-clock startup
+    cmds:
+      - cargo build --release --quiet
+      - |
+        if command -v hyperfine >/dev/null 2>&1; then
+          hyperfine --warmup 2 --runs 5 'target/release/asm --benchmark'
+        else
+          /usr/bin/time -p target/release/asm --benchmark
+        fi
+
   run:
     desc: Run asm; pass args after --
     cmds:
@@ -69,9 +85,12 @@ tasks:
       - cargo run --release -- reindex
 
   install:
-    desc: Install asm on PATH
+    desc: Install asm on PATH and set up zsh PATH/hook
     cmds:
       - cargo install --path .
+      - ~/.cargo/bin/asm install
+      - echo
+      - echo "→ run 'source ~/.zshrc' (or open a new terminal) to pick up PATH + hooks"
 
   uninstall:
     desc: Remove asm from PATH
