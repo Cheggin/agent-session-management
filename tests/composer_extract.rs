@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use asm::{
+    ui::{filter::Chip, App},
     Agent,
-    ui::{App, filter::Chip},
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -22,6 +22,10 @@ fn type_text(app: &mut App, text: &str) {
 
 fn backspace(app: &mut App) {
     assert!(app.handle_composer_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE,)));
+}
+
+fn alt_backspace(app: &mut App) {
+    assert!(app.handle_composer_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT,)));
 }
 
 #[test]
@@ -93,8 +97,67 @@ fn backspace_at_cursor_start_removes_live_chip_before_seeded_chip() {
     assert_eq!(app.chips(), &[seeded.clone(), Chip::Agent(Agent::Claude)]);
 
     backspace(&mut app);
+    assert_eq!(app.chip_delete_pending, Some(1));
+    assert_eq!(app.chips(), &[seeded.clone(), Chip::Agent(Agent::Claude)]);
+
+    backspace(&mut app);
     assert_eq!(app.chips(), &[seeded]);
+    assert_eq!(app.chip_delete_pending, None);
+
+    backspace(&mut app);
+    assert_eq!(app.chip_delete_pending, Some(0));
+    assert_eq!(app.chips(), &[Chip::HereCwd(here_cwd())]);
 
     backspace(&mut app);
     assert_eq!(app.chips(), &[]);
+    assert_eq!(app.chip_delete_pending, None);
+}
+
+#[test]
+fn backspace_at_cursor_start_with_chip_first_highlights_then_deletes() {
+    let seeded = Chip::HereCwd(here_cwd());
+    let mut app = App::new_with_chips(Vec::new(), cwd().to_path_buf(), vec![seeded]);
+
+    backspace(&mut app);
+    assert_eq!(app.chips().len(), 1);
+    assert_eq!(app.chip_delete_pending, Some(0));
+
+    backspace(&mut app);
+    assert!(app.chips().is_empty());
+    assert_eq!(app.chip_delete_pending, None);
+}
+
+#[test]
+fn non_backspace_clears_pending() {
+    let seeded = Chip::HereCwd(here_cwd());
+    let mut app = App::new_with_chips(Vec::new(), cwd().to_path_buf(), vec![seeded.clone()]);
+
+    backspace(&mut app);
+    assert_eq!(app.chip_delete_pending, Some(0));
+
+    type_text(&mut app, "x");
+    assert_eq!(app.chip_delete_pending, None);
+    assert_eq!(app.chips(), &[seeded]);
+}
+
+#[test]
+fn alt_backspace_with_only_chips_is_noop() {
+    let seeded = Chip::HereCwd(here_cwd());
+    let mut app = App::new_with_chips(Vec::new(), cwd().to_path_buf(), vec![seeded.clone()]);
+
+    alt_backspace(&mut app);
+
+    assert_eq!(app.chips(), &[seeded]);
+}
+
+#[test]
+fn alt_backspace_with_text_deletes_word_only() {
+    let seeded = Chip::HereCwd(here_cwd());
+    let mut app = App::new_with_chips(Vec::new(), cwd().to_path_buf(), vec![seeded.clone()]);
+
+    type_text(&mut app, "foo bar");
+    alt_backspace(&mut app);
+
+    assert_eq!(app.composer_input(), "foo ");
+    assert_eq!(app.chips(), &[seeded]);
 }

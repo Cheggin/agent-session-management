@@ -2,19 +2,16 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use ratatui::{
-    Frame,
     layout::{Constraint, Direction, Layout, Margin, Position, Rect},
+    style::Modifier,
     text::{Line, Span},
     widgets::{Block, Borders, Padding, Paragraph},
+    Frame,
 };
 
 use crate::{Agent, Session};
 
-use super::{
-    app::App,
-    filter::{Chip, chip_label},
-    fork_picker, sparkline, theme,
-};
+use super::{app::App, filter::chip_label, fork_picker, sparkline, theme};
 
 const SPARK_HOURS: usize = 24;
 const SPARK_MIN_SESSIONS: usize = 2;
@@ -25,7 +22,6 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         horizontal: 2,
         vertical: 1,
     });
-    let show_chips = !app.chips.is_empty() || app.toast_text().is_some();
     let spark_buckets = if app.filtered_count() >= SPARK_MIN_SESSIONS {
         let b = sparkline::hourly_start_buckets(app.filtered_sessions(), Utc::now(), SPARK_HOURS);
         (b.iter().sum::<u32>() > 0).then_some(b)
@@ -35,10 +31,6 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     let show_spark = spark_buckets.is_some();
 
     let mut constraints = Vec::new();
-    if show_chips {
-        constraints.push(Constraint::Length(1));
-        constraints.push(Constraint::Length(1));
-    }
     if show_spark {
         constraints.push(Constraint::Length(1));
         constraints.push(Constraint::Length(1));
@@ -56,10 +48,6 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         .split(area);
 
     let mut row_idx = 0;
-    if show_chips {
-        render_chip_strip(frame, rows[row_idx], app);
-        row_idx += 2;
-    }
     if let Some(buckets) = spark_buckets.as_ref() {
         sparkline::render_strip(frame, rows[row_idx], buckets);
         row_idx += 2;
@@ -68,54 +56,43 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     row_idx += 2;
     render_middle(frame, rows[row_idx], app);
     row_idx += 2;
-    render_hint(frame, rows[row_idx]);
+    render_hint(frame, rows[row_idx], app.toast_text());
 
     if let Some(picker) = app.fork_picker_mut() {
         fork_picker::render_overlay(frame, full, picker);
     }
 }
 
-fn render_chip_strip(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let mut spans = Vec::new();
-    let mut used = 0usize;
-
-    if let Some(toast) = app.toast_text() {
-        push_text(&mut spans, &mut used, " ", theme::text_style());
-        push_text(&mut spans, &mut used, toast, theme::toast());
-        push_text(&mut spans, &mut used, "  ", theme::text_style());
-    }
-
-    for chip in &app.chips {
-        push_text(&mut spans, &mut used, " ", theme::text_style());
-        push_text(&mut spans, &mut used, &chip_label(chip), chip_style(chip));
-    }
-
-    let count = format!("{} sessions", app.filtered_count());
-    let spacer = (area.width as usize).saturating_sub(used + count.chars().count());
-    spans.push(Span::raw(" ".repeat(spacer)));
-    spans.push(Span::styled(count, theme::dim()));
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
 fn render_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let prefix = "search › ";
-    let line = if app.composer.is_empty() {
-        Line::from(vec![
-            Span::styled(prefix, theme::accent()),
-            Span::styled("type to search, @tag to filter", theme::dim()),
-        ])
+    let mut spans = vec![Span::styled(prefix, theme::accent())];
+    let mut cursor_offset = prefix.chars().count();
+
+    for (idx, chip) in app.chips().iter().enumerate() {
+        let label = format!("[{}]", chip_label(chip));
+        let style = if app.chip_delete_pending == Some(idx) {
+            theme::chip().add_modifier(Modifier::REVERSED)
+        } else {
+            theme::chip()
+        };
+        cursor_offset += label.chars().count() + 1;
+        spans.push(Span::styled(label, style));
+        spans.push(Span::raw(" "));
+    }
+
+    if app.composer.is_empty() && app.chips().is_empty() {
+        spans.push(Span::styled("type to search, @tag to filter", theme::dim()));
     } else {
-        Line::from(vec![
-            Span::styled(prefix, theme::accent()),
-            Span::raw(app.composer.input().to_owned()),
-        ])
-    };
-    frame.render_widget(Paragraph::new(line), area);
+        spans.push(Span::raw(app.composer.input().to_owned()));
+        cursor_offset += app.composer.cursor();
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 
     if area.width > 0 {
         let cursor_x = area
             .x
-            .saturating_add((prefix.chars().count() + app.composer.cursor()) as u16)
+            .saturating_add(cursor_offset as u16)
             .min(area.x.saturating_add(area.width.saturating_sub(1)));
         frame.set_cursor_position(Position {
             x: cursor_x,
@@ -160,7 +137,15 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn render_hint(frame: &mut Frame<'_>, area: Rect) {
+fn render_hint(frame: &mut Frame<'_>, area: Rect, toast: Option<&str>) {
+    if let Some(toast) = toast {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(toast.to_owned(), theme::toast()))),
+            area,
+        );
+        return;
+    }
+
     let hint = "enter resume   ctrl-f fork   ctrl-e export   ↑/↓ select   pgup/pgdn page   ctrl-r/F5 reindex   esc/ctrl-c quit";
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(hint, theme::dim()))),
@@ -203,25 +188,6 @@ fn list_row(session: &Session, width: usize) -> Line<'static> {
         Span::raw("  "),
         Span::styled(truncate(branch, branch_w), theme::branch()),
     ])
-}
-
-fn push_text(
-    spans: &mut Vec<Span<'static>>,
-    used: &mut usize,
-    text: &str,
-    style: ratatui::style::Style,
-) {
-    *used += text.chars().count();
-    spans.push(Span::styled(text.to_owned(), style));
-}
-
-fn chip_style(chip: &Chip) -> ratatui::style::Style {
-    match chip {
-        Chip::Agent(agent) => theme::agent(agent),
-        Chip::Running => theme::live(),
-        Chip::Branch(_) => theme::branch(),
-        _ => theme::chip(),
-    }
 }
 
 fn agent_name(agent: &Agent) -> &'static str {

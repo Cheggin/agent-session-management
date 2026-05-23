@@ -6,13 +6,13 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::{Session, liveness::mark_live_sessions, reindex::ReindexStats};
+use crate::{liveness::mark_live_sessions, reindex::ReindexStats, Session};
 
 use super::{
     composer::Composer,
-    filter::{Chip, apply_filters_with_haystacks, build_session_haystacks_optional, parse_chip},
+    filter::{apply_filters_with_haystacks, build_session_haystacks_optional, parse_chip, Chip},
     fork_picker::ForkPicker,
 };
 
@@ -27,6 +27,7 @@ pub struct App {
     pub(crate) list_height: usize,
     pub(crate) composer: Composer,
     pub(crate) chips: Vec<Chip>,
+    pub chip_delete_pending: Option<usize>,
     pub(crate) search: String,
     pub(crate) current_cwd: PathBuf,
     pub(crate) last_reindex_time: Option<DateTime<Utc>>,
@@ -90,6 +91,7 @@ impl App {
             list_height: 1,
             composer: Composer::default(),
             chips: Vec::new(),
+            chip_delete_pending: None,
             search: String::new(),
             current_cwd,
             last_reindex_time: None,
@@ -147,6 +149,12 @@ impl App {
             .cloned()
             .chain(self.live_chips.iter().cloned())
             .collect();
+        if self
+            .chip_delete_pending
+            .is_some_and(|pending| pending >= self.chips.len())
+        {
+            self.chip_delete_pending = None;
+        }
         self.search = normalize_search_text(self.composer.input());
         self.filtered_indices = apply_filters_with_haystacks(
             &self.sessions,
@@ -158,8 +166,23 @@ impl App {
     }
 
     pub fn handle_composer_key(&mut self, key: KeyEvent) -> bool {
-        if matches!(key.code, KeyCode::Backspace) && self.remove_chip_at_cursor_start() {
-            return true;
+        if !matches!(key.code, KeyCode::Backspace) {
+            self.chip_delete_pending = None;
+        }
+
+        if matches!(key.code, KeyCode::Backspace) {
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                if self.composer.is_empty() {
+                    return true;
+                }
+                self.composer.delete_word_backward();
+                self.refresh_filters();
+                return true;
+            }
+
+            if self.composer.cursor() == 0 && !self.chips.is_empty() {
+                return self.handle_chip_backspace();
+            }
         }
 
         if !self.composer.handle_key(key) {
@@ -184,23 +207,37 @@ impl App {
             return false;
         }
 
-        if let Some(chip) = self.live_chips.pop() {
-            if super::filter::is_sql_pushdown_chip(&chip) {
-                self.pushdown_filter_dirty = true;
-            }
-            self.refresh_filters();
+        if self.chips.is_empty() {
+            return false;
+        };
+
+        self.pop_rightmost_chip();
+        self.chip_delete_pending = None;
+        self.refresh_filters();
+        true
+    }
+
+    fn handle_chip_backspace(&mut self) -> bool {
+        if self.chip_delete_pending.is_none() {
+            self.chip_delete_pending = Some(self.chips.len() - 1);
             return true;
         }
 
-        let Some(chip) = self.seeded_chips.pop() else {
-            return false;
-        };
-        if super::filter::is_sql_pushdown_chip(&chip) {
-            self.pushdown_filter_dirty = true;
-        }
-
+        self.pop_rightmost_chip();
+        self.chip_delete_pending = None;
         self.refresh_filters();
         true
+    }
+
+    fn pop_rightmost_chip(&mut self) {
+        let chip = self.live_chips.pop().or_else(|| self.seeded_chips.pop());
+
+        if chip
+            .as_ref()
+            .is_some_and(super::filter::is_sql_pushdown_chip)
+        {
+            self.pushdown_filter_dirty = true;
+        }
     }
 
     pub fn take_pushdown_filter_dirty(&mut self) -> bool {

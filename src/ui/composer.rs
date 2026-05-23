@@ -40,6 +40,26 @@ impl Composer {
         };
     }
 
+    pub(crate) fn delete_word_backward(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+
+        let chars = self.text.chars().collect::<Vec<_>>();
+        let mut start = self.cursor;
+        if chars[start - 1].is_whitespace() {
+            while start > 0 && chars[start - 1].is_whitespace() {
+                start -= 1;
+            }
+        } else {
+            while start > 0 && !chars[start - 1].is_whitespace() {
+                start -= 1;
+            }
+        }
+
+        self.remove_range(start, self.cursor);
+    }
+
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()
     }
