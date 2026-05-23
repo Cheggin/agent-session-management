@@ -1,6 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    thread,
     time::{Instant, UNIX_EPOCH},
 };
 
@@ -32,6 +33,13 @@ enum Source {
 struct Candidate {
     source: Source,
     path: PathBuf,
+    path_mtime: i64,
+}
+
+#[derive(Debug)]
+struct ParsedSession {
+    source: Source,
+    session: Session,
     path_mtime: i64,
 }
 
@@ -83,9 +91,7 @@ pub fn reindex_all(
                 }
             };
 
-            if index.get_path_mtime(&path)? == Some(path_mtime)
-                && index.path_has_message_bodies(&path)?
-            {
+            if index.get_path_mtime(&path)? == Some(path_mtime) {
                 stats.skipped_unchanged += 1;
                 continue;
             }
@@ -141,7 +147,11 @@ pub fn reindex_all(
         let span = info_span!("asm.reindex.write");
         let _enter = span.enter();
         let started = Instant::now();
-        let result = index.upsert_sessions(&parsed_sessions);
+        let sessions_only: Vec<_> = parsed_sessions
+            .iter()
+            .map(|parsed| (parsed.session.clone(), parsed.path_mtime))
+            .collect();
+        let result = index.upsert_sessions_only(&sessions_only);
         info!(
             elapsed_ms = elapsed_ms(started),
             parsed = stats.parsed,
@@ -150,6 +160,9 @@ pub fn reindex_all(
         );
         result?;
     }
+
+    spawn_message_fts_upsert(index.path().to_path_buf(), parsed_sessions);
+
     index.mark_reindexed_now()?;
 
     info!(
@@ -163,32 +176,80 @@ pub fn reindex_all(
     Ok(stats)
 }
 
+fn spawn_message_fts_upsert(index_path: PathBuf, parsed_sessions: Vec<ParsedSession>) {
+    if parsed_sessions.is_empty() {
+        return;
+    }
+
+    thread::spawn(move || {
+        let span = info_span!("asm.reindex.fts_background");
+        let _enter = span.enter();
+        let started = Instant::now();
+        let parsed = parsed_sessions.len();
+        let result = (|| -> Result<(usize, usize)> {
+            let mut background_index = Index::open_at(index_path)?;
+            let mut failed = 0;
+            let mut messages = Vec::with_capacity(parsed_sessions.len());
+            for parsed_session in parsed_sessions {
+                match extract_message_bodies(parsed_session.source, &parsed_session.session.path) {
+                    Ok(message_bodies) => {
+                        messages.push((parsed_session.session.id, message_bodies));
+                    }
+                    Err(error) => {
+                        failed += 1;
+                        warn!(
+                            path = %parsed_session.session.path.display(),
+                            error = %error,
+                            "failed to extract message bodies for FTS"
+                        );
+                    }
+                }
+            }
+
+            background_index.upsert_messages_fts(&messages)?;
+            Ok((messages.len(), failed))
+        })();
+
+        match result {
+            Ok((indexed, failed)) => info!(
+                elapsed_ms = elapsed_ms(started),
+                parsed, indexed, failed, "background FTS population complete"
+            ),
+            Err(error) => warn!(
+                elapsed_ms = elapsed_ms(started),
+                parsed,
+                error = %error,
+                "background FTS population failed"
+            ),
+        }
+    });
+}
+
 fn elapsed_ms(started: Instant) -> u128 {
     started.elapsed().as_millis()
 }
 
 fn parse_candidate(
     candidate: Candidate,
-) -> std::result::Result<(Session, i64, Vec<String>), (PathBuf, anyhow::Error)> {
-    let (session, message_bodies) = match candidate.source {
-        Source::Claude => {
-            let session = ClaudeParser::parse(&candidate.path);
-            session.and_then(|session| {
-                ClaudeParser::extract_message_bodies(&candidate.path)
-                    .map(|message_bodies| (session, message_bodies))
-            })
-        }
-        Source::Codex => {
-            let session = CodexParser::parse(&candidate.path);
-            session.and_then(|session| {
-                CodexParser::extract_message_bodies(&candidate.path)
-                    .map(|message_bodies| (session, message_bodies))
-            })
-        }
+) -> std::result::Result<ParsedSession, (PathBuf, anyhow::Error)> {
+    let session = match candidate.source {
+        Source::Claude => ClaudeParser::parse(&candidate.path),
+        Source::Codex => CodexParser::parse(&candidate.path),
     }
     .map_err(|error| (candidate.path.clone(), error))?;
 
-    Ok((session, candidate.path_mtime, message_bodies))
+    Ok(ParsedSession {
+        source: candidate.source,
+        session,
+        path_mtime: candidate.path_mtime,
+    })
+}
+
+fn extract_message_bodies(source: Source, path: &Path) -> Result<Vec<String>> {
+    match source {
+        Source::Claude => ClaudeParser::extract_message_bodies(path),
+        Source::Codex => CodexParser::extract_message_bodies(path),
+    }
 }
 
 fn path_mtime(path: &Path) -> Result<i64> {

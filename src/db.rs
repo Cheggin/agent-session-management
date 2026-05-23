@@ -102,6 +102,7 @@ ON CONFLICT(path) DO UPDATE SET
 
 pub struct Index {
     conn: Connection,
+    path: PathBuf,
 }
 
 impl Index {
@@ -118,16 +119,16 @@ impl Index {
         let _enter = span.enter();
         let started = Instant::now();
         let result = (|| {
-            let path = path.as_ref();
+            let path = path.as_ref().to_path_buf();
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).with_context(|| {
                     format!("failed to create index directory {}", parent.display())
                 })?;
             }
 
-            let conn = Connection::open(path)
+            let conn = Connection::open(&path)
                 .with_context(|| format!("failed to open SQLite index {}", path.display()))?;
-            let index = Self { conn };
+            let index = Self { conn, path };
             index.migrate()?;
             Ok(index)
         })();
@@ -137,6 +138,10 @@ impl Index {
             "startup phase complete"
         );
         result
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     pub fn upsert_session(
@@ -165,6 +170,36 @@ impl Index {
                 path_mtime,
                 message_bodies,
             )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn upsert_sessions_only(&mut self, sessions: &[(Session, i64)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut upsert_stmt = tx.prepare(UPSERT_SESSION)?;
+            for (session, path_mtime) in sessions {
+                execute_upsert(&mut upsert_stmt, session, *path_mtime)?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn upsert_messages_fts(&mut self, messages: &[(String, Vec<String>)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut delete_by_id_stmt =
+                tx.prepare("DELETE FROM messages_fts WHERE session_id = ?1")?;
+            let mut insert_body_stmt =
+                tx.prepare("INSERT INTO messages_fts (session_id, body) VALUES (?1, ?2)")?;
+            for (session_id, message_bodies) in messages {
+                delete_by_id_stmt.execute(params![session_id])?;
+                for body in message_bodies.iter().filter(|body| !body.trim().is_empty()) {
+                    insert_body_stmt.execute(params![session_id, body])?;
+                }
+            }
         }
         tx.commit()?;
         Ok(())
@@ -415,6 +450,12 @@ WHERE is_sidechain = 0
     }
 
     fn migrate(&self) -> Result<()> {
+        self.conn.execute_batch(
+            r#"
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+"#,
+        )?;
         self.conn.execute_batch(SCHEMA)?;
         self.ensure_recent_user_prompts_column()?;
         Ok(())
