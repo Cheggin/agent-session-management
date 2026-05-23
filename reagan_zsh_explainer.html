@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>How zsh resolves a command — and how `asm` would hijack `claude` / `codex`</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --fg: #e7e9ee;
+    --muted: #8b95a7;
+    --accent: #7dd3fc;
+    --accent2: #a78bfa;
+    --hit: #34d399;
+    --miss: #f87171;
+    --rule: #1f2430;
+    --card: #161a23;
+    --code: #11141b;
+  }
+  * { box-sizing: border-box; }
+  html, body { background: var(--bg); color: var(--fg); margin: 0; padding: 0; }
+  body { font: 16px/1.55 -apple-system, "SF Pro Text", system-ui, sans-serif; padding: 48px 24px 96px; }
+  main { max-width: 880px; margin: 0 auto; }
+  h1, h2, h3 { font-weight: 600; letter-spacing: -0.01em; }
+  h1 { font-size: 32px; margin: 0 0 8px; }
+  h1 + .sub { color: var(--muted); margin-bottom: 40px; font-size: 17px; }
+  h2 { margin: 56px 0 12px; padding-bottom: 6px; border-bottom: 1px solid var(--rule); font-size: 22px; }
+  h3 { margin: 28px 0 8px; font-size: 17px; color: var(--accent); }
+  p { color: var(--fg); }
+  .muted { color: var(--muted); }
+  code, pre { font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace; }
+  code { background: var(--code); padding: 1px 6px; border-radius: 4px; font-size: 0.92em; color: var(--accent); }
+  pre { background: var(--code); padding: 16px 20px; border-radius: 8px; overflow-x: auto; border: 1px solid var(--rule); }
+  pre code { background: none; padding: 0; color: var(--fg); font-size: 0.88em; }
+  .kw { color: var(--accent2); }
+  .str { color: #fcd34d; }
+  .com { color: var(--muted); font-style: italic; }
+  .fn { color: var(--hit); }
+  .card { background: var(--card); border: 1px solid var(--rule); border-radius: 10px; padding: 20px 24px; margin: 16px 0; }
+  ol, ul { padding-left: 22px; }
+  li { margin: 4px 0; }
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .tag.hit { background: rgba(52,211,153,.15); color: var(--hit); }
+  .tag.miss { background: rgba(248,113,113,.15); color: var(--miss); }
+  .tag.neutral { background: rgba(167,139,250,.15); color: var(--accent2); }
+
+  /* resolution diagram */
+  .flow { display: grid; grid-template-columns: 180px 1fr; gap: 10px 18px; align-items: center; margin: 18px 0; }
+  .flow .step { background: var(--card); border: 1px solid var(--rule); padding: 10px 14px; border-radius: 8px; font-family: "JetBrains Mono", monospace; font-size: 13px; }
+  .flow .step.hit { border-color: var(--hit); background: rgba(52,211,153,.08); }
+  .flow .desc { color: var(--muted); font-size: 14px; }
+
+  /* before/after */
+  .ba { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin: 20px 0; }
+  .ba .col { background: var(--card); border: 1px solid var(--rule); border-radius: 10px; padding: 18px; }
+  .ba .col h4 { margin: 0 0 10px; font-size: 14px; color: var(--accent); text-transform: uppercase; letter-spacing: 0.08em; }
+
+  .proc { font-family: "JetBrains Mono", monospace; font-size: 13px; color: var(--muted); line-height: 1.7; }
+  .proc .pid { color: var(--accent2); }
+  .proc .cmd { color: var(--fg); }
+
+  .callout { border-left: 3px solid var(--accent); background: rgba(125,211,252,.06); padding: 14px 18px; border-radius: 0 8px 8px 0; margin: 16px 0; }
+  .callout.warn { border-color: #fbbf24; background: rgba(251,191,36,.06); }
+</style>
+</head>
+<body>
+<main>
+
+<h1>How zsh resolves a command</h1>
+<div class="sub">…and the trick that lets <code>asm</code> hijack <code>claude --resume</code> and <code>codex resume</code> without you noticing.</div>
+
+<h2>1. What a shell actually does</h2>
+<p>
+  zsh (or bash, or fish) is a <strong>REPL for the operating system</strong>. You type a line, it reads, parses, decides what that line means, runs something, and prints the output. The "decides what that line means" step is where all the interesting stuff lives.
+</p>
+<p>
+  When you type:
+</p>
+<pre><code><span class="kw">claude</span> --resume abc123</code></pre>
+<p>
+  zsh has to answer: <em>what is</em> <code>claude</code>? It's not a keyword. It's a name. zsh walks through a fixed lookup order to figure out what the name refers to.
+</p>
+
+<h2>2. The name resolution order</h2>
+<p>This is the whole secret. zsh checks these places, <strong>in this order</strong>, and stops at the first hit:</p>
+
+<div class="flow">
+  <div class="step">1. alias</div>
+  <div class="desc">Simple text substitution defined with <code>alias claude=...</code>. Limited: can't inspect arguments.</div>
+
+  <div class="step">2. function</div>
+  <div class="desc">A named block of shell code defined with <code>claude() { ... }</code>. Can look at arguments, branch, call other things. <strong>This is where the trick lives.</strong></div>
+
+  <div class="step">3. builtin</div>
+  <div class="desc">Commands baked into zsh itself: <code>cd</code>, <code>echo</code>, <code>command</code>, <code>exec</code>. You can't override these by editing PATH.</div>
+
+  <div class="step">4. hashed</div>
+  <div class="desc">A cache of "I already looked up the full path to <code>claude</code> last time, it lives at <code>/opt/homebrew/bin/claude</code>." Refresh with <code>rehash</code>.</div>
+
+  <div class="step">5. PATH lookup</div>
+  <div class="desc">zsh walks each directory in <code>$PATH</code> from left to right, looking for an executable file named <code>claude</code>. First match wins.</div>
+
+  <div class="step step hit">6. ✗ command not found</div>
+  <div class="desc">Nothing matched anywhere. zsh prints the familiar error.</div>
+</div>
+
+<p class="muted">Aliases, functions, and builtins all live inside the running zsh process. Hashed entries and PATH lookups produce a full filesystem path, which zsh will then <code>fork()</code> + <code>execve()</code> as a separate program.</p>
+
+<h2>3. How zsh starts: where do functions come from?</h2>
+<p>
+  When you open a new terminal tab, zsh starts as an <em>interactive login</em> shell. Before showing you the prompt, it sources a chain of config files in a fixed order. The one almost everyone edits is:
+</p>
+<pre><code>~/.zshrc</code></pre>
+<p>
+  Everything in <code>~/.zshrc</code> runs inside the current shell — definitions stick. If <code>~/.zshrc</code> contains:
+</p>
+<pre><code><span class="fn">claude</span>() {
+  <span class="com"># intercept --resume; pass everything else through</span>
+  <span class="kw">for</span> arg <span class="kw">in</span> <span class="str">"$@"</span>; <span class="kw">do</span>
+    [[ <span class="str">"$arg"</span> == <span class="str">"--resume"</span> ]] && <span class="kw">exec</span> asm --filter claude
+  <span class="kw">done</span>
+  <span class="kw">command</span> claude <span class="str">"$@"</span>
+}</code></pre>
+<p>
+  then your shell now knows about a function called <code>claude</code>. Resolution order says functions are checked before PATH. The real binary at <code>/opt/homebrew/bin/claude</code> is still there — it just isn't what your typed name resolves to anymore.
+</p>
+
+<h2>4. Before and after, side by side</h2>
+<p>Same command, two different shells. The only difference is whether the function exists.</p>
+
+<div class="ba">
+  <div class="col">
+    <h4>Before — no function</h4>
+    <p class="muted">You type:</p>
+    <pre><code>claude --resume abc</code></pre>
+    <ol>
+      <li><span class="tag miss">no alias</span></li>
+      <li><span class="tag miss">no function</span></li>
+      <li><span class="tag miss">not a builtin</span></li>
+      <li><span class="tag hit">PATH: /opt/homebrew/bin/claude</span></li>
+    </ol>
+    <p class="muted">zsh forks, execs the real Claude CLI with <code>["--resume", "abc"]</code> as argv. You get Claude's native resume picker.</p>
+  </div>
+  <div class="col">
+    <h4>After — function defined</h4>
+    <p class="muted">You type:</p>
+    <pre><code>claude --resume abc</code></pre>
+    <ol>
+      <li><span class="tag miss">no alias</span></li>
+      <li><span class="tag hit">function: claude()</span></li>
+    </ol>
+    <p class="muted">zsh runs the function body in the current shell. The loop sees <code>--resume</code>, fires <code>exec asm --filter claude</code>. You get the <code>asm</code> list with <code>@claude</code> pre-applied.</p>
+  </div>
+</div>
+
+<h2>5. Two builtins doing all the work</h2>
+
+<h3><code>command</code> — "skip the function lookup"</h3>
+<p>
+  Inside a function called <code>claude</code>, writing <code>claude "$@"</code> would call the function <em>again</em> — infinite recursion. <code>command claude "$@"</code> tells zsh: "start resolution from step 3 (builtins) onward, skipping aliases and functions." That's how you call the real binary from inside your override.
+</p>
+
+<h3><code>exec</code> — "replace this process, don't spawn a child"</h3>
+<p>
+  Normally when a shell runs another program, it does <code>fork()</code> (make a copy of itself) then <code>execve()</code> (replace the copy with the new program). Your shell stays around as the parent, waiting for the child to exit.
+</p>
+<p>
+  <code>exec asm --filter claude</code> skips the fork. The running zsh process is replaced in place by <code>asm</code>. Same PID, same terminal, same controlling tty. When <code>asm</code> exits, the shell session ends — which is exactly what you want for "resume into this session." It feels seamless because there's no parent shell sitting underneath waiting.
+</p>
+
+<div class="callout">
+  <strong>Why this matters for the asm case:</strong> Codex and Claude Code both take over the terminal (raw mode, alternate screen buffer, etc.). If <code>asm</code> launches them as a child and then waits, you'd briefly see <code>asm</code> render, then a child program render on top, then on exit you'd be back in <code>asm</code>'s screen for a frame before zsh redraws. <code>exec</code> means <code>asm</code> hands the terminal off cleanly and doesn't come back.
+</div>
+
+<h2>6. What the process tree looks like</h2>
+
+<h3>Without exec</h3>
+<div class="proc">
+zsh <span class="pid">(pid 41001)</span> ── <span class="cmd">the shell sitting at your prompt</span><br>
+└── asm <span class="pid">(pid 41089)</span> ── <span class="cmd">forked from zsh; runs the picker</span><br>
+    └── claude <span class="pid">(pid 41112)</span> ── <span class="cmd">forked from asm; runs the agent</span>
+</div>
+<p class="muted">When <code>claude</code> exits, you're back in <code>asm</code>. When <code>asm</code> exits, you're back in <code>zsh</code>. Two layers of "where am I" the user has to track.</p>
+
+<h3>With exec</h3>
+<div class="proc">
+zsh <span class="pid">(pid 41001)</span> ── <span class="cmd">replaced in place by asm, which is replaced in place by claude</span><br>
+<span class="muted">     ^ now this PID is claude. No extra processes.</span>
+</div>
+<p class="muted">When the agent exits, the shell session is done. Open a new terminal tab for a fresh one. This is what people expect.</p>
+
+<h2>7. Putting it all together</h2>
+
+<h3>The full proposed function for <code>~/.asm/shell-hooks.zsh</code></h3>
+<pre><code><span class="com"># sourced from ~/.zshrc by `asm install`</span>
+
+<span class="fn">claude</span>() {
+  <span class="kw">for</span> arg <span class="kw">in</span> <span class="str">"$@"</span>; <span class="kw">do</span>
+    <span class="kw">if</span> [[ <span class="str">"$arg"</span> == <span class="str">"--resume"</span> ]]; <span class="kw">then</span>
+      <span class="kw">exec</span> asm --filter claude
+    <span class="kw">fi</span>
+  <span class="kw">done</span>
+  <span class="kw">command</span> claude <span class="str">"$@"</span>
+}
+
+<span class="fn">codex</span>() {
+  <span class="kw">if</span> [[ <span class="str">"$1"</span> == <span class="str">"resume"</span> ]]; <span class="kw">then</span>
+    <span class="kw">exec</span> asm --filter codex
+  <span class="kw">fi</span>
+  <span class="kw">command</span> codex <span class="str">"$@"</span>
+}</code></pre>
+
+<h3>The one-line bootstrap added to <code>~/.zshrc</code></h3>
+<pre><code>[[ -f ~/.asm/shell-hooks.zsh ]] && <span class="kw">source</span> ~/.asm/shell-hooks.zsh</code></pre>
+
+<p>
+  That's it. <code>asm install</code> writes the file and adds the line (idempotently, checks for the line first). <code>asm uninstall</code> reverses both. No magic, no daemon, no PATH games — just two function definitions getting picked up by zsh's normal resolution order.
+</p>
+
+<h2>8. What's different from how rtk does it</h2>
+<div class="card">
+  <p><strong>rtk</strong> is a Claude Code <em>PreToolUse hook</em>. It only fires when the Claude Code agent invokes Bash with a command like <code>git status</code> — the hook rewrites the invocation to <code>rtk git status</code> before it runs. None of this is visible to your shell. You type <code>git status</code> in your own terminal, rtk does nothing.</p>
+  <p><strong>asm</strong>'s shell hook is the opposite: it lives in <em>your shell</em>, fires only when <em>you</em> type a command at the prompt, and is completely invisible to Claude Code or Codex when they call <code>git</code>/whatever themselves.</p>
+  <p>Both are valid; they just operate at different layers. Combining them would be fine — they never see each other.</p>
+</div>
+
+<div class="callout warn">
+  <strong>Gotcha:</strong> shell functions only exist in <em>interactive shells</em>. If you launch <code>claude --resume</code> from a script with <code>#!/bin/sh</code>, no function is loaded. That's almost always what you want — scripts should keep using the real binary, not pop a TUI. If you ever <em>did</em> want scripts to be hijacked too, you'd need the PATH-shim approach (a file named <code>claude</code> earlier in <code>$PATH</code>), not the function approach.
+</div>
+
+</main>
+</body>
+</html>
