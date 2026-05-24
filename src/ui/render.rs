@@ -179,7 +179,6 @@ fn render_preview(frame: &mut Frame<'_>, area: Rect, app: &App) {
             session
                 .recent_user_prompts
                 .iter()
-                .rev()
                 .map(|prompt| Line::from(format!("› {prompt}"))),
         );
     }
@@ -208,6 +207,10 @@ fn render_hint(frame: &mut Frame<'_>, area: Rect, toast: Option<&str>) {
     );
 }
 
+const CWD_CAP: usize = 30;
+const BRANCH_CAP: usize = 24;
+const TITLE_MIN: usize = 12;
+
 fn list_row(session: &Session, width: usize) -> Line<'static> {
     let live = if session.is_live { "●" } else { " " };
     let agent = agent_name(&session.agent);
@@ -215,10 +218,20 @@ fn list_row(session: &Session, width: usize) -> Line<'static> {
     let cwd_tail = session.cwd.as_deref().map(cwd_tail).unwrap_or_default();
     let branch = session.git_branch.as_deref().unwrap_or_default();
 
-    let cwd_w = width.saturating_sub(48).min(22);
-    let branch_w = width.saturating_sub(62).min(22);
-    let fixed = 2 + 8 + 5 + cwd_w + branch_w + 6;
-    let title_w = width.saturating_sub(fixed).max(8);
+    // Fixed-width left columns: live(2) + agent(6) + sep(2) + age(4) + sep(2) + sep_to_cwd(2) + sep_to_branch(2).
+    let fixed_left = 2 + 6 + 2 + 4 + 2;
+    let sep_to_cwd = 2;
+    let sep_to_branch = 2;
+
+    // Reserve only what cwd/branch actually need (capped), so a short branch like "main"
+    // doesn't steal width from the title column.
+    let cwd_len = cwd_tail.chars().count().min(CWD_CAP);
+    let branch_len = branch.chars().count().min(BRANCH_CAP);
+    let right_reserved = sep_to_cwd + cwd_len + sep_to_branch + branch_len;
+
+    let title_w = width
+        .saturating_sub(fixed_left + right_reserved)
+        .max(TITLE_MIN);
     let title = truncate(&session_title(session), title_w);
 
     Line::from(vec![
@@ -237,11 +250,11 @@ fn list_row(session: &Session, width: usize) -> Line<'static> {
         Span::raw(format!("{title:<title_w$}")),
         Span::raw("  "),
         Span::styled(
-            format!("{:<cwd_w$}", truncate(&cwd_tail, cwd_w)),
+            format!("{:<cwd_len$}", truncate(&cwd_tail, cwd_len)),
             theme::dim(),
         ),
         Span::raw("  "),
-        Span::styled(truncate(branch, branch_w), theme::branch()),
+        Span::styled(truncate(branch, branch_len), theme::branch()),
     ])
 }
 
