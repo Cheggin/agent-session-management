@@ -13,9 +13,9 @@ use asm::{
     cli::parse_list_filter_chips,
     db::Index,
     export::{export_session, export_session_to_path},
-    fork::{end_cut_index, fork_session},
+    fork::{ForkRoots, end_cut_index, fork_session, fork_session_timed},
     reindex::reindex_all,
-    resume::dispatch_resume,
+    resume::{dispatch_resume, resume_command},
     shell::{install_zsh, print_install_report, print_uninstall_report, uninstall_zsh},
     ui::{self, filter::Chip},
 };
@@ -74,6 +74,28 @@ enum Command {
         /// Output markdown file path. Defaults to ./asm-export-<agent>-<id>.md.
         #[arg(long, value_name = "path")]
         out: Option<PathBuf>,
+    },
+
+    /// Benchmark fork phases (read/validate/write) without resuming. Created
+    /// fork files are deleted after each iteration.
+    #[command(hide = true)]
+    BenchFork {
+        id: String,
+        /// Zero-based source JSONL line index to cut at. Defaults to the end.
+        #[arg(long, value_name = "n")]
+        at: Option<usize>,
+        /// Number of iterations.
+        #[arg(long, default_value_t = 5)]
+        repeat: usize,
+    },
+
+    /// Benchmark the resume code path up to (but not including) exec.
+    #[command(hide = true)]
+    BenchResume {
+        id: String,
+        /// Number of iterations.
+        #[arg(long, default_value_t = 5)]
+        repeat: usize,
     },
 }
 
@@ -185,9 +207,135 @@ fn main() -> Result<()> {
             };
             eprintln!("exported to {}", export_path.display());
         }
+        Some(Command::BenchFork { id, at, repeat }) => {
+            reject_filter_for_non_list(cli.filter.as_deref());
+            run_bench_fork(&id, at, repeat)?;
+        }
+        Some(Command::BenchResume { id, repeat }) => {
+            reject_filter_for_non_list(cli.filter.as_deref());
+            run_bench_resume(&id, repeat)?;
+        }
     }
 
     Ok(())
+}
+
+fn run_bench_fork(id: &str, at: Option<usize>, repeat: usize) -> Result<()> {
+    let repeat = repeat.max(1);
+    let lookup_started = Instant::now();
+    let index = Index::open()?;
+    let sessions = index.list_all()?;
+    let session = sessions
+        .into_iter()
+        .find(|session| session.id == id)
+        .with_context(|| format!("no indexed session found with id {id}"))?;
+    let cut_index = match at {
+        Some(cut_index) => cut_index,
+        None => end_cut_index(&session.path)?,
+    };
+    let current_cwd = std::env::current_dir().context("failed to read current directory")?;
+    let home = dirs::home_dir().context("could not determine home directory")?;
+    let roots = ForkRoots::from_home(&home);
+    let lookup_us = lookup_started.elapsed().as_micros();
+
+    eprintln!(
+        "bench-fork: id={} agent={:?} cut_index={} repeat={}",
+        session.id, session.agent, cut_index, repeat
+    );
+    eprintln!("bench-fork: index+lookup={}us", lookup_us);
+
+    let mut read = Vec::with_capacity(repeat);
+    let mut validate = Vec::with_capacity(repeat);
+    let mut write = Vec::with_capacity(repeat);
+    let mut total = Vec::with_capacity(repeat);
+    let mut last_line_count = 0usize;
+    let mut created: Vec<PathBuf> = Vec::with_capacity(repeat);
+
+    for i in 0..repeat {
+        let (result, timings) =
+            fork_session_timed(&session, &session.path, cut_index, &current_cwd, &roots)?;
+        last_line_count = timings.line_count;
+        read.push(timings.read_jsonl_us);
+        validate.push(timings.validate_us);
+        write.push(timings.transform_write_us);
+        total.push(timings.total_us);
+        eprintln!(
+            "  iter {}: total={}us read={}us validate={}us write={}us lines={}",
+            i + 1,
+            timings.total_us,
+            timings.read_jsonl_us,
+            timings.validate_us,
+            timings.transform_write_us,
+            timings.line_count,
+        );
+        created.push(result.path);
+    }
+
+    print_stats("read_jsonl   ", &read);
+    print_stats("validate     ", &validate);
+    print_stats("transform+wr ", &write);
+    print_stats("TOTAL        ", &total);
+    eprintln!("bench-fork: line_count={}", last_line_count);
+
+    for path in created {
+        let _ = fs::remove_file(&path);
+    }
+    Ok(())
+}
+
+fn run_bench_resume(id: &str, repeat: usize) -> Result<()> {
+    let repeat = repeat.max(1);
+    let lookup_started = Instant::now();
+    let index = Index::open()?;
+    let sessions = index.list_all()?;
+    let session = sessions
+        .into_iter()
+        .find(|session| session.id == id)
+        .with_context(|| format!("no indexed session found with id {id}"))?;
+    let lookup_us = lookup_started.elapsed().as_micros();
+
+    eprintln!(
+        "bench-resume: id={} agent={:?} repeat={}",
+        session.id, session.agent, repeat
+    );
+    eprintln!("bench-resume: index+lookup={}us", lookup_us);
+
+    let mut argv_times = Vec::with_capacity(repeat);
+    for i in 0..repeat {
+        let t = Instant::now();
+        let argv = resume_command(&session);
+        let elapsed = t.elapsed().as_micros();
+        argv_times.push(elapsed);
+        eprintln!(
+            "  iter {}: argv_build={}us argv={:?}",
+            i + 1,
+            elapsed,
+            argv
+        );
+    }
+
+    print_stats("argv_build   ", &argv_times);
+    eprintln!(
+        "bench-resume: NOTE the actual exec(2) call is a single syscall (~10us);"
+    );
+    eprintln!("              perceived latency is dominated by claude/codex startup.");
+    Ok(())
+}
+
+fn print_stats(label: &str, samples: &[u128]) {
+    if samples.is_empty() {
+        return;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let min = sorted[0];
+    let max = *sorted.last().unwrap();
+    let median = sorted[sorted.len() / 2];
+    let mean = samples.iter().sum::<u128>() / samples.len() as u128;
+    eprintln!(
+        "{label} min={}us median={}us mean={}us max={}us",
+        min, median, mean, max
+    );
 }
 
 fn elapsed_ms(started: Instant) -> u128 {

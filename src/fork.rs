@@ -3,6 +3,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::Command,
+    time::Instant,
 };
 
 use anyhow::{Context, Result, bail};
@@ -30,6 +31,15 @@ pub struct TurnCut {
 pub struct ForkResult {
     pub path: PathBuf,
     pub id: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ForkPhaseTimings {
+    pub read_jsonl_us: u128,
+    pub validate_us: u128,
+    pub transform_write_us: u128,
+    pub total_us: u128,
+    pub line_count: usize,
 }
 
 impl ForkRoots {
@@ -87,6 +97,38 @@ pub fn fork_session_with_roots(
     }
 
     Ok(forked.path)
+}
+
+pub fn fork_session_timed(
+    source: &Session,
+    source_path: &Path,
+    cut_index: usize,
+    current_cwd: &Path,
+    roots: &ForkRoots,
+) -> Result<(ForkResult, ForkPhaseTimings)> {
+    let total = Instant::now();
+    let mut timings = ForkPhaseTimings::default();
+
+    let t = Instant::now();
+    let lines = read_jsonl_lines(source_path)?;
+    timings.read_jsonl_us = t.elapsed().as_micros();
+    timings.line_count = lines.len();
+
+    let t = Instant::now();
+    validate_cut_index(&source.agent, &lines, cut_index, source_path)?;
+    timings.validate_us = t.elapsed().as_micros();
+
+    let t = Instant::now();
+    let forked = match source.agent {
+        Agent::Claude => {
+            write_claude_fork_from_lines(&lines, cut_index, current_cwd, &roots.claude)?
+        }
+        Agent::Codex => write_codex_fork_from_lines(&lines, cut_index, current_cwd, &roots.codex)?,
+    };
+    timings.transform_write_us = t.elapsed().as_micros();
+
+    timings.total_us = total.elapsed().as_micros();
+    Ok((forked, timings))
 }
 
 pub fn end_cut_index(source_path: &Path) -> Result<usize> {
