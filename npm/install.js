@@ -15,7 +15,6 @@ const VERSION = pkg.version;
 
 const PLATFORM_MAP = {
   'darwin-arm64': 'aarch64-apple-darwin',
-  'darwin-x64': 'x86_64-apple-darwin',
   'linux-x64': 'x86_64-unknown-linux-gnu',
 };
 
