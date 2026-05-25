@@ -1,0 +1,47 @@
+{
+  "name": "@reaganhsu/asm",
+  "version": "0.1.0",
+  "description": "Agent Session Manager — fuzzy-search and resume Claude/Codex sessions from one TUI.",
+  "bin": {
+    "asm": "bin/asm"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "files": [
+    "install.js",
+    "bin/asm",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Cheggin/agent-session-management.git"
+  },
+  "homepage": "https://github.com/Cheggin/agent-session-management",
+  "bugs": {
+    "url": "https://github.com/Cheggin/agent-session-management/issues"
+  },
+  "license": "MIT",
+  "keywords": [
+    "claude",
+    "codex",
+    "agent",
+    "session",
+    "tui",
+    "cli",
+    "fuzzy",
+    "resume"
+  ]
+}

@@ -1,3 +1,4 @@
 /target
-/.omc/
-/.harness/
+.omc/
+.harness/
+node_modules/

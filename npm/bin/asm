@@ -1,0 +1,6 @@
+#!/bin/sh
+# Placeholder shim. Overwritten by ../install.js with the native `asm` binary
+# during `npm install`. If you're seeing this message, the postinstall step
+# did not run — try `npm rebuild @reaganhsu/asm` or reinstall.
+echo "@reaganhsu/asm: native binary missing; run 'npm rebuild @reaganhsu/asm' or reinstall." >&2
+exit 127
