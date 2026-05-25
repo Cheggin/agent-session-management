@@ -14,8 +14,8 @@ npm install -g @reaganhsu/asm
 ```sh
 asm                  # picker scoped to the current directory
 asm --global         # all sessions
-claude -- resume     # auto detected, proxies to asm"
-codex resume         # auto detected, proxies to asm"
+claude -- resume     # auto detected, proxies to asm
+codex resume         # auto detected, proxies to asm
 ```
 
 | key | action |
