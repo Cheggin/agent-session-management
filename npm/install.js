@@ -81,6 +81,29 @@ async function downloadAndExtract(target, destBin) {
   }
 }
 
+function maybeInstallShellHook(asmBin) {
+  if (process.env.ASM_SKIP_SHELL_HOOK === '1') {
+    process.stdout.write('@reaganhsu/asm: ASM_SKIP_SHELL_HOOK=1, skipping shell hook setup\n');
+    return;
+  }
+  const shell = process.env.SHELL || '';
+  if (!shell.endsWith('/zsh') && shell !== 'zsh') {
+    process.stdout.write(
+      `@reaganhsu/asm: shell is ${shell || 'unknown'}, not zsh — skipping hook. ` +
+      `Re-run 'asm install' manually if you switch to zsh.\n`
+    );
+    return;
+  }
+  try {
+    execSync(`${JSON.stringify(asmBin)} install`, { stdio: 'inherit' });
+  } catch (err) {
+    process.stderr.write(
+      `@reaganhsu/asm: 'asm install' failed (${err.message}); ` +
+      `run it manually to enable claude --resume / codex resume proxying.\n`
+    );
+  }
+}
+
 async function main() {
   if (process.env.ASM_SKIP_DOWNLOAD === '1') {
     process.stdout.write('@reaganhsu/asm: ASM_SKIP_DOWNLOAD=1, skipping binary download\n');
@@ -90,6 +113,7 @@ async function main() {
   const destBin = path.join(__dirname, 'bin', 'asm');
   await downloadAndExtract(target, destBin);
   process.stdout.write(`@reaganhsu/asm: installed ${destBin}\n`);
+  maybeInstallShellHook(destBin);
 }
 
 main().catch((err) => {

@@ -5,13 +5,22 @@ use anyhow::{Context, Result};
 use crate::{Agent, Session};
 
 pub fn resume_command(session: &Session) -> Vec<String> {
+    // Skip the per-tool-call permission prompt by default. Users want resume
+    // to drop straight back into the conversation without re-approving every
+    // file read; opt back in by running `claude`/`codex` directly.
     match session.agent {
         Agent::Claude => vec![
             "claude".to_owned(),
             "--resume".to_owned(),
             session.id.clone(),
+            "--dangerously-skip-permissions".to_owned(),
         ],
-        Agent::Codex => vec!["codex".to_owned(), "resume".to_owned(), session.id.clone()],
+        Agent::Codex => vec![
+            "codex".to_owned(),
+            "resume".to_owned(),
+            session.id.clone(),
+            "--yolo".to_owned(),
+        ],
     }
 }
 

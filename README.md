@@ -12,6 +12,8 @@ npm install -g @reaganhsu/asm
 
 Downloads a prebuilt binary for macOS (Intel + Apple Silicon) or Linux x86_64. No Rust toolchain required.
 
+On zsh systems the postinstall also runs `asm install` automatically, which writes `~/.asm/shell-hooks.zsh` and adds a source line to `~/.zshrc` so bare `claude --resume` / `codex resume` open the asm picker. To opt out, install with `ASM_SKIP_SHELL_HOOK=1 npm install -g @reaganhsu/asm`.
+
 ### From source
 
 Requires Rust (`rustup` works fine).
@@ -40,6 +42,8 @@ asm ls --filter "claude branch:main"
 | @tag | filter chips inside the search bar (agent, branch, repo, …) |
 | ctrl-r / F5 | re-index |
 | esc / ctrl-c | quit |
+
+Resume always passes `--dangerously-skip-permissions` to `claude` and `--yolo` to `codex` so you drop straight back into the conversation without re-approving every tool call. If you want the permission prompts back, launch the agent directly instead of through asm.
 
 ## Release process
 
