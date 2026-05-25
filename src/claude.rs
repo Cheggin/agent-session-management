@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     fs::File,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -6,39 +7,89 @@ use std::{
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use serde::Deserialize;
 use serde_json::Value;
+use serde_json::value::RawValue;
 
 use crate::{Agent, Entrypoint, Parser, Session};
 
+const READ_BUF_CAP: usize = 128 * 1024;
+
 pub struct ClaudeParser;
+
+/// Top-level Claude JSONL event. `message` is captured as RawValue so the
+/// (potentially huge) `message.content` tree is never deserialized during the
+/// main walk — it's only decoded for the lines whose text we actually need
+/// (user turns + the final assistant turn).
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeEvent<'a> {
+    #[serde(default, borrow, rename = "type")]
+    event_type: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    timestamp: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    cwd: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    git_branch: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    entrypoint: Option<Cow<'a, str>>,
+    #[serde(default)]
+    is_sidechain: bool,
+    #[serde(default)]
+    is_meta: bool,
+    #[serde(default, borrow)]
+    ai_title: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    message: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize, Default)]
+struct ClaudeMessage<'a> {
+    #[serde(default, borrow)]
+    content: Option<&'a RawValue>,
+}
 
 impl ClaudeParser {
     pub fn extract_message_bodies(path: &Path) -> Result<Vec<String>> {
         let file = File::open(path)
             .with_context(|| format!("failed to open Claude session {}", path.display()))?;
-        let reader = BufReader::new(file);
+        let mut reader = BufReader::with_capacity(READ_BUF_CAP, file);
         let mut bodies = Vec::new();
+        let mut line_buf = String::new();
 
-        for line in reader.lines() {
-            let line = line.with_context(|| {
-                format!("failed to read Claude session line from {}", path.display())
-            })?;
-            let trimmed = line.trim();
+        loop {
+            line_buf.clear();
+            let n = reader
+                .read_line(&mut line_buf)
+                .with_context(|| format!("failed to read Claude session line from {}", path.display()))?;
+            if n == 0 {
+                break;
+            }
+            let trimmed = line_buf.trim();
             if trimmed.is_empty() {
                 continue;
             }
 
-            let Ok(event) = serde_json::from_str::<Value>(trimmed) else {
+            let Ok(event) = serde_json::from_str::<ClaudeEvent<'_>>(trimmed) else {
                 continue;
             };
 
-            match event.get("type").and_then(Value::as_str) {
-                Some("user") if !is_meta(&event) => bodies.extend(
-                    user_text_bodies(&event)
-                        .into_iter()
-                        .filter(|t| !is_system_noise(t)),
-                ),
-                Some("assistant") => bodies.extend(assistant_text_bodies(&event)),
+            match event.event_type.as_deref() {
+                Some("user") if !event.is_meta => {
+                    if let Some(message) = event.message {
+                        bodies.extend(
+                            user_text_bodies(message)
+                                .into_iter()
+                                .filter(|t| !is_system_noise(t)),
+                        );
+                    }
+                }
+                Some("assistant") => {
+                    if let Some(message) = event.message {
+                        bodies.extend(assistant_text_bodies(message));
+                    }
+                }
                 _ => {}
             }
         }
@@ -51,7 +102,7 @@ impl Parser for ClaudeParser {
     fn parse(path: &Path) -> Result<Session> {
         let file = File::open(path)
             .with_context(|| format!("failed to open Claude session {}", path.display()))?;
-        let reader = BufReader::new(file);
+        let mut reader = BufReader::with_capacity(READ_BUF_CAP, file);
 
         let id = path
             .file_stem()
@@ -66,36 +117,46 @@ impl Parser for ClaudeParser {
         let mut title: Option<String> = None;
         let mut first_user_prompt: Option<String> = None;
         let mut recent_user_prompts = Vec::new();
-        let mut last_assistant_text: Option<String> = None;
+        // Raw text of the last assistant line. Parsed once at end to extract
+        // the assistant text — avoids per-line content walking.
+        let mut last_assistant_raw: Option<String> = None;
         let mut started_at: Option<DateTime<Utc>> = None;
         let mut last_user_msg_at: Option<DateTime<Utc>> = None;
         let mut last_assistant_msg_at: Option<DateTime<Utc>> = None;
         let mut user_msg_count = 0_u32;
         let mut is_sidechain = false;
+        let mut line_buf = String::new();
 
-        for line in reader.lines() {
-            let line = line.with_context(|| {
-                format!("failed to read Claude session line from {}", path.display())
-            })?;
-            let trimmed = line.trim();
+        loop {
+            line_buf.clear();
+            let n = reader
+                .read_line(&mut line_buf)
+                .with_context(|| format!("failed to read Claude session line from {}", path.display()))?;
+            if n == 0 {
+                break;
+            }
+            let trimmed = line_buf.trim();
             if trimmed.is_empty() {
                 continue;
             }
 
-            let Ok(event) = serde_json::from_str::<Value>(trimmed) else {
+            let Ok(event) = serde_json::from_str::<ClaudeEvent<'_>>(trimmed) else {
                 continue;
             };
 
-            let timestamp = parse_timestamp(event.get("timestamp"));
+            let timestamp = parse_timestamp_str(event.timestamp.as_deref());
             if started_at.is_none() {
                 started_at = timestamp;
             }
 
-            if cwd.is_none() {
-                cwd = event.get("cwd").and_then(Value::as_str).map(PathBuf::from);
+            if cwd.is_none()
+                && let Some(c) = event.cwd.as_deref()
+            {
+                cwd = Some(PathBuf::from(c));
             }
 
-            if !saw_git_branch && let Some(branch) = event.get("gitBranch").and_then(Value::as_str)
+            if !saw_git_branch
+                && let Some(branch) = event.git_branch.as_deref()
             {
                 saw_git_branch = true;
                 if branch != "HEAD" {
@@ -103,36 +164,32 @@ impl Parser for ClaudeParser {
                 }
             }
 
-            if entrypoint.is_none() {
-                entrypoint = event
-                    .get("entrypoint")
-                    .and_then(Value::as_str)
-                    .map(parse_entrypoint);
+            if entrypoint.is_none()
+                && let Some(ep) = event.entrypoint.as_deref()
+            {
+                entrypoint = Some(parse_entrypoint(ep));
             }
 
-            if event
-                .get("isSidechain")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
+            if event.is_sidechain {
                 is_sidechain = true;
             }
 
-            match event.get("type").and_then(Value::as_str) {
+            match event.event_type.as_deref() {
                 Some("ai-title") => {
-                    if let Some(ai_title) = event.get("aiTitle").and_then(Value::as_str) {
+                    if let Some(ai_title) = event.ai_title.as_deref() {
                         title = Some(ai_title.to_owned());
                     }
                 }
                 Some("user") => {
-                    if is_meta(&event) {
+                    if event.is_meta {
                         continue;
                     }
-
-                    let Some(prompt) = user_prompt_text(&event) else {
+                    let Some(message_raw) = event.message else {
                         continue;
                     };
-
+                    let Some(prompt) = first_user_text(message_raw) else {
+                        continue;
+                    };
                     if is_system_noise(&prompt) {
                         continue;
                     }
@@ -150,13 +207,18 @@ impl Parser for ClaudeParser {
                     if let Some(timestamp) = timestamp {
                         last_assistant_msg_at = Some(timestamp);
                     }
-                    if let Some(text) = assistant_text(&event) {
-                        last_assistant_text = Some(text);
-                    }
+                    // Defer text extraction to end of file — only the last
+                    // assistant message needs decoding.
+                    last_assistant_raw = Some(trimmed.to_owned());
                 }
                 _ => {}
             }
         }
+
+        let last_assistant_text = last_assistant_raw
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<ClaudeEvent<'_>>(raw).ok())
+            .and_then(|event| event.message.and_then(last_assistant_text));
 
         let started_at = started_at.with_context(|| {
             format!(
@@ -186,9 +248,8 @@ impl Parser for ClaudeParser {
     }
 }
 
-fn parse_timestamp(value: Option<&Value>) -> Option<DateTime<Utc>> {
+fn parse_timestamp_str(value: Option<&str>) -> Option<DateTime<Utc>> {
     value
-        .and_then(Value::as_str)
         .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
         .map(|timestamp| timestamp.with_timezone(&Utc))
 }
@@ -202,56 +263,54 @@ fn parse_entrypoint(value: &str) -> Entrypoint {
     }
 }
 
-fn is_meta(event: &Value) -> bool {
-    event
-        .get("isMeta")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
+fn first_user_text(message: &RawValue) -> Option<String> {
+    user_text_bodies(message).into_iter().next()
 }
 
-fn user_prompt_text(event: &Value) -> Option<String> {
-    user_text_bodies(event).into_iter().next()
-}
-
-fn user_text_bodies(event: &Value) -> Vec<String> {
-    let Some(content) = event
-        .get("message")
-        .and_then(|message| message.get("content"))
-    else {
+fn user_text_bodies(message: &RawValue) -> Vec<String> {
+    let Ok(msg) = serde_json::from_str::<ClaudeMessage<'_>>(message.get()) else {
         return Vec::new();
     };
+    let Some(content) = msg.content else {
+        return Vec::new();
+    };
+    extract_text_bodies(content)
+}
 
-    match content {
-        Value::String(text) => nonempty_trimmed(text).into_iter().collect(),
+fn last_assistant_text(message: &RawValue) -> Option<String> {
+    assistant_text_bodies(message).into_iter().last()
+}
+
+fn assistant_text_bodies(message: &RawValue) -> Vec<String> {
+    let Ok(msg) = serde_json::from_str::<ClaudeMessage<'_>>(message.get()) else {
+        return Vec::new();
+    };
+    let Some(content) = msg.content else {
+        return Vec::new();
+    };
+    extract_text_bodies(content)
+}
+
+/// Parse a `content` field (either a string or an array of {type,text} parts).
+fn extract_text_bodies(content: &RawValue) -> Vec<String> {
+    let raw = content.get();
+    let value: Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    match value {
+        Value::String(text) => nonempty_trimmed(&text).into_iter().collect(),
         Value::Array(parts) => parts
-            .iter()
+            .into_iter()
             .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
-            .filter_map(|part| part.get("text").and_then(Value::as_str))
-            .filter_map(nonempty_trimmed)
+            .filter_map(|part| {
+                part.get("text")
+                    .and_then(Value::as_str)
+                    .and_then(nonempty_trimmed)
+            })
             .collect(),
         _ => Vec::new(),
     }
-}
-
-fn assistant_text(event: &Value) -> Option<String> {
-    assistant_text_bodies(event).into_iter().last()
-}
-
-fn assistant_text_bodies(event: &Value) -> Vec<String> {
-    let Some(parts) = event
-        .get("message")
-        .and_then(|message| message.get("content"))
-        .and_then(Value::as_array)
-    else {
-        return Vec::new();
-    };
-
-    parts
-        .iter()
-        .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
-        .filter_map(|part| part.get("text").and_then(Value::as_str))
-        .filter_map(nonempty_trimmed)
-        .collect()
 }
 
 fn nonempty_trimmed(text: &str) -> Option<String> {
@@ -282,3 +341,4 @@ fn remember_recent_user_prompt(recent_user_prompts: &mut Vec<String>, prompt: St
         recent_user_prompts.remove(0);
     }
 }
+

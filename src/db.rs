@@ -454,6 +454,9 @@ WHERE is_sidechain = 0
             r#"
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
+PRAGMA temp_store = MEMORY;
+PRAGMA cache_size = -65536;
+PRAGMA mmap_size = 268435456;
 "#,
         )?;
         self.conn.execute_batch(SCHEMA)?;

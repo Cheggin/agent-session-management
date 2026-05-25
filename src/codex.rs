@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     fs::File,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -6,53 +7,104 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-use serde_json::Value;
+use serde::Deserialize;
+use serde_json::value::RawValue;
 
 use crate::{Agent, Entrypoint, Parser, Session};
 
+const READ_BUF_CAP: usize = 128 * 1024;
+
 pub struct CodexParser;
+
+/// Top-level Codex JSONL event. `payload` is captured as RawValue so it's
+/// only deserialized for the event types we actually use.
+#[derive(Deserialize, Default)]
+struct CodexEvent<'a> {
+    #[serde(default, borrow, rename = "type")]
+    event_type: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    timestamp: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    payload: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize, Default)]
+struct CodexEventPayload<'a> {
+    #[serde(default, borrow, rename = "type")]
+    payload_type: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    message: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    last_agent_message: Option<Cow<'a, str>>,
+}
+
+#[derive(Deserialize, Default)]
+struct CodexSessionMetaPayload<'a> {
+    #[serde(default, borrow)]
+    id: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    timestamp: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    cwd: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    git: Option<CodexGit<'a>>,
+    #[serde(default, borrow)]
+    originator: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    thread_source: Option<Cow<'a, str>>,
+}
+
+#[derive(Deserialize, Default)]
+struct CodexGit<'a> {
+    #[serde(default, borrow)]
+    branch: Option<Cow<'a, str>>,
+}
 
 impl CodexParser {
     pub fn extract_message_bodies(path: &Path) -> Result<Vec<String>> {
         let file = File::open(path)
             .with_context(|| format!("failed to open Codex session {}", path.display()))?;
-        let reader = BufReader::new(file);
+        let mut reader = BufReader::with_capacity(READ_BUF_CAP, file);
         let mut bodies = Vec::new();
+        let mut line_buf = String::new();
 
-        for line in reader.lines() {
-            let line = line.with_context(|| {
+        loop {
+            line_buf.clear();
+            let n = reader.read_line(&mut line_buf).with_context(|| {
                 format!("failed to read Codex session line from {}", path.display())
             })?;
-            let trimmed = line.trim();
+            if n == 0 {
+                break;
+            }
+            let trimmed = line_buf.trim();
             if trimmed.is_empty() {
                 continue;
             }
 
-            let Ok(event) = serde_json::from_str::<Value>(trimmed) else {
+            let Ok(event) = serde_json::from_str::<CodexEvent<'_>>(trimmed) else {
                 continue;
             };
-
-            if event.get("type").and_then(Value::as_str) != Some("event_msg") {
+            if event.event_type.as_deref() != Some("event_msg") {
                 continue;
             }
-
-            let Some(payload) = event.get("payload") else {
+            let Some(payload_raw) = event.payload else {
                 continue;
             };
-            match payload.get("type").and_then(Value::as_str) {
+            let Ok(payload) = serde_json::from_str::<CodexEventPayload<'_>>(payload_raw.get())
+            else {
+                continue;
+            };
+
+            match payload.payload_type.as_deref() {
                 Some("user_message") | Some("agent_message") => {
-                    if let Some(message) = payload
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .and_then(nonempty_trimmed)
-                    {
+                    if let Some(message) = payload.message.as_deref().and_then(nonempty_trimmed) {
                         bodies.push(message);
                     }
                 }
                 Some("task_complete") => {
                     if let Some(message) = payload
-                        .get("last_agent_message")
-                        .and_then(Value::as_str)
+                        .last_agent_message
+                        .as_deref()
                         .and_then(nonempty_trimmed)
                     {
                         bodies.push(message);
@@ -70,41 +122,51 @@ impl Parser for CodexParser {
     fn parse(path: &Path) -> Result<Session> {
         let file = File::open(path)
             .with_context(|| format!("failed to open Codex session {}", path.display()))?;
-        let reader = BufReader::new(file);
-        let mut lines = reader.lines();
+        let mut reader = BufReader::with_capacity(READ_BUF_CAP, file);
+        let mut line_buf = String::new();
 
-        let session_meta = read_session_meta(&mut lines, path)?;
-        let payload = session_meta
-            .get("payload")
-            .context("Codex session_meta event has no payload")?;
+        // Locate the first parseable event; it must be session_meta.
+        let meta_text = read_session_meta_line(&mut reader, &mut line_buf, path)?;
+        let meta_event: CodexEvent<'_> = serde_json::from_str(&meta_text)
+            .with_context(|| format!("Codex session {} session_meta is malformed", path.display()))?;
+        if meta_event.event_type.as_deref() != Some("session_meta") {
+            bail!(
+                "Codex session {} first parseable event is not session_meta",
+                path.display()
+            );
+        }
+        let payload_raw = meta_event
+            .payload
+            .with_context(|| format!("Codex session {} session_meta has no payload", path.display()))?;
+        let meta_payload: CodexSessionMetaPayload<'_> = serde_json::from_str(payload_raw.get())
+            .with_context(|| {
+                format!("Codex session {} session_meta payload is malformed", path.display())
+            })?;
 
-        let id = payload
-            .get("id")
-            .and_then(Value::as_str)
-            .context("Codex session_meta payload has no id")?
+        let id = meta_payload
+            .id
+            .as_deref()
+            .with_context(|| format!("Codex session {} session_meta payload has no id", path.display()))?
             .to_owned();
-        let started_at = parse_timestamp(payload.get("timestamp")).with_context(|| {
+        let started_at = parse_timestamp_str(meta_payload.timestamp.as_deref()).with_context(|| {
             format!(
                 "Codex session {} has no parseable payload timestamp",
                 path.display()
             )
         })?;
-        let cwd = payload
-            .get("cwd")
-            .and_then(Value::as_str)
-            .map(PathBuf::from);
-        let git_branch = payload
-            .get("git")
-            .and_then(|git| git.get("branch"))
-            .and_then(Value::as_str)
+        let cwd = meta_payload.cwd.as_deref().map(PathBuf::from);
+        let git_branch = meta_payload
+            .git
+            .as_ref()
+            .and_then(|git| git.branch.as_deref())
             .map(str::to_owned);
-        let entrypoint = payload
-            .get("originator")
-            .and_then(Value::as_str)
+        let entrypoint = meta_payload
+            .originator
+            .as_deref()
             .map(parse_entrypoint);
-        let is_sidechain = payload
-            .get("thread_source")
-            .and_then(Value::as_str)
+        let is_sidechain = meta_payload
+            .thread_source
+            .as_deref()
             .is_some_and(|thread_source| thread_source == "subagent");
 
         let mut first_user_prompt: Option<String> = None;
@@ -115,49 +177,56 @@ impl Parser for CodexParser {
         let mut last_assistant_msg_at: Option<DateTime<Utc>> = None;
         let mut user_msg_count = 0_u32;
 
-        for line in lines {
-            let line = line.with_context(|| {
+        loop {
+            line_buf.clear();
+            let n = reader.read_line(&mut line_buf).with_context(|| {
                 format!("failed to read Codex session line from {}", path.display())
             })?;
-            let trimmed = line.trim();
+            if n == 0 {
+                break;
+            }
+            let trimmed = line_buf.trim();
             if trimmed.is_empty() {
                 continue;
             }
 
-            let Ok(event) = serde_json::from_str::<Value>(trimmed) else {
+            let Ok(event) = serde_json::from_str::<CodexEvent<'_>>(trimmed) else {
                 continue;
             };
-
-            if event.get("type").and_then(Value::as_str) != Some("event_msg") {
+            if event.event_type.as_deref() != Some("event_msg") {
                 continue;
             }
 
-            let timestamp = parse_timestamp(event.get("timestamp"));
-            let Some(payload) = event.get("payload") else {
+            let timestamp = parse_timestamp_str(event.timestamp.as_deref());
+            let Some(payload_raw) = event.payload else {
+                continue;
+            };
+            let Ok(payload) = serde_json::from_str::<CodexEventPayload<'_>>(payload_raw.get())
+            else {
                 continue;
             };
 
-            match payload.get("type").and_then(Value::as_str) {
+            match payload.payload_type.as_deref() {
                 Some("user_message") => {
                     user_msg_count += 1;
-                    if first_user_prompt.is_none()
-                        && let Some(message) = payload.get("message").and_then(Value::as_str)
-                    {
-                        first_user_prompt = Some(message.trim().to_owned());
-                    }
-                    if let Some(message) = payload
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .and_then(nonempty_trimmed)
-                    {
-                        remember_recent_user_prompt(&mut recent_user_prompts, message);
+                    if let Some(message) = payload.message.as_deref() {
+                        let trimmed_msg = message.trim();
+                        if !trimmed_msg.is_empty() {
+                            if first_user_prompt.is_none() {
+                                first_user_prompt = Some(trimmed_msg.to_owned());
+                            }
+                            remember_recent_user_prompt(
+                                &mut recent_user_prompts,
+                                trimmed_msg.to_owned(),
+                            );
+                        }
                     }
                     if let Some(timestamp) = timestamp {
                         last_user_msg_at = Some(timestamp);
                     }
                 }
                 Some("agent_message") => {
-                    if let Some(message) = payload.get("message").and_then(Value::as_str) {
+                    if let Some(message) = payload.message.as_deref() {
                         last_agent_message = Some(message.to_owned());
                     }
                     if let Some(timestamp) = timestamp {
@@ -165,8 +234,7 @@ impl Parser for CodexParser {
                     }
                 }
                 Some("task_complete") => {
-                    if let Some(message) = payload.get("last_agent_message").and_then(Value::as_str)
-                    {
+                    if let Some(message) = payload.last_agent_message.as_deref() {
                         last_task_complete_message = Some(message.to_owned());
                     }
                     if let Some(timestamp) = timestamp {
@@ -198,39 +266,29 @@ impl Parser for CodexParser {
     }
 }
 
-fn read_session_meta(
-    lines: &mut impl Iterator<Item = std::io::Result<String>>,
+fn read_session_meta_line(
+    reader: &mut BufReader<File>,
+    line_buf: &mut String,
     path: &Path,
-) -> Result<Value> {
-    for line in lines {
-        let line = line.with_context(|| {
+) -> Result<String> {
+    loop {
+        line_buf.clear();
+        let n = reader.read_line(line_buf).with_context(|| {
             format!("failed to read Codex session line from {}", path.display())
         })?;
-        let trimmed = line.trim();
+        if n == 0 {
+            bail!("Codex session {} has no session_meta event", path.display());
+        }
+        let trimmed = line_buf.trim();
         if trimmed.is_empty() {
             continue;
         }
-
-        let Ok(event) = serde_json::from_str::<Value>(trimmed) else {
-            continue;
-        };
-
-        if event.get("type").and_then(Value::as_str) == Some("session_meta") {
-            return Ok(event);
-        }
-
-        bail!(
-            "Codex session {} first parseable event is not session_meta",
-            path.display()
-        );
+        return Ok(trimmed.to_owned());
     }
-
-    bail!("Codex session {} has no session_meta event", path.display());
 }
 
-fn parse_timestamp(value: Option<&Value>) -> Option<DateTime<Utc>> {
+fn parse_timestamp_str(value: Option<&str>) -> Option<DateTime<Utc>> {
     value
-        .and_then(Value::as_str)
         .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
         .map(|timestamp| timestamp.with_timezone(&Utc))
 }
