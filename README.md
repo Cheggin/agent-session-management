@@ -4,34 +4,18 @@ Fuzzy-search and resume your Claude Code and Codex sessions from one TUI.
 
 ## Install
 
-### npm (recommended)
+### npm
 
 ```sh
 npm install -g @reaganhsu/asm
 ```
-
-Downloads a prebuilt binary for macOS (Intel + Apple Silicon) or Linux x86_64. No Rust toolchain required.
-
-On zsh systems the postinstall also runs `asm install` automatically, which writes `~/.asm/shell-hooks.zsh` and adds a source line to `~/.zshrc` so bare `claude --resume` / `codex resume` open the asm picker. To opt out, install with `ASM_SKIP_SHELL_HOOK=1 npm install -g @reaganhsu/asm`.
-
-### From source
-
-Requires Rust (`rustup` works fine).
-
-```sh
-git clone https://github.com/Cheggin/agent-session-management
-cd agent-session-management
-task install        # or: cargo install --path . && asm install
-```
-
-`asm install` writes a zsh hook to `~/.asm/shell-hooks.zsh` and sources it from `~/.zshrc`, so that bare `claude --resume` / `codex resume` open the picker.
-
 ## Use
 
 ```sh
 asm                  # picker scoped to the current directory
 asm --global         # all sessions
-asm ls --filter "claude branch:main"
+claude -- resume     # auto detected, proxies to asm"
+codex resume         # auto detected, proxies to asm"
 ```
 
 | key | action |
@@ -43,19 +27,3 @@ asm ls --filter "claude branch:main"
 | ctrl-r / F5 | re-index |
 | esc / ctrl-c | quit |
 
-Resume always passes `--dangerously-skip-permissions` to `claude` and `--yolo` to `codex` so you drop straight back into the conversation without re-approving every tool call. If you want the permission prompts back, launch the agent directly instead of through asm.
-
-## Release process
-
-Tag-driven. Pushing a `v*` tag triggers `.github/workflows/release.yml`, which:
-
-1. Cross-compiles `asm` for `aarch64-apple-darwin`, `x86_64-apple-darwin`, and `x86_64-unknown-linux-gnu`.
-2. Attaches the three tarballs + `SHA256SUMS` to a GitHub Release.
-3. Publishes `@reaganhsu/asm@<version>` to npm using `secrets.NPM_TOKEN`.
-
-To cut a release:
-
-```sh
-git tag v0.1.0
-git push origin v0.1.0
-```
