@@ -244,9 +244,6 @@ fn run_bench_fork(id: &str, at: Option<usize>, repeat: usize) -> Result<()> {
     );
     eprintln!("bench-fork: index+lookup={}us", lookup_us);
 
-    let mut read = Vec::with_capacity(repeat);
-    let mut validate = Vec::with_capacity(repeat);
-    let mut write = Vec::with_capacity(repeat);
     let mut total = Vec::with_capacity(repeat);
     let mut last_line_count = 0usize;
     let mut created: Vec<PathBuf> = Vec::with_capacity(repeat);
@@ -255,25 +252,16 @@ fn run_bench_fork(id: &str, at: Option<usize>, repeat: usize) -> Result<()> {
         let (result, timings) =
             fork_session_timed(&session, &session.path, cut_index, &current_cwd, &roots)?;
         last_line_count = timings.line_count;
-        read.push(timings.read_jsonl_us);
-        validate.push(timings.validate_us);
-        write.push(timings.transform_write_us);
         total.push(timings.total_us);
         eprintln!(
-            "  iter {}: total={}us read={}us validate={}us write={}us lines={}",
+            "  iter {}: total={}us lines={}",
             i + 1,
             timings.total_us,
-            timings.read_jsonl_us,
-            timings.validate_us,
-            timings.transform_write_us,
             timings.line_count,
         );
         created.push(result.path);
     }
 
-    print_stats("read_jsonl   ", &read);
-    print_stats("validate     ", &validate);
-    print_stats("transform+wr ", &write);
     print_stats("TOTAL        ", &total);
     eprintln!("bench-fork: line_count={}", last_line_count);
 
