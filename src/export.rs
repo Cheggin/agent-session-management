@@ -7,10 +7,7 @@ use std::{
 use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 
-use crate::{Agent, Session};
-
-const EXPORT_NOTE: &str =
-    "Note: this export shows the bookends only. Full transcript dump is planned for a later step.";
+use crate::{Agent, ClaudeParser, CodexParser, Session, TranscriptRole, TranscriptTurn};
 
 pub fn export_session(session: &Session, dest_dir: &Path) -> Result<PathBuf> {
     fs::create_dir_all(dest_dir)
@@ -38,28 +35,23 @@ fn write_markdown(session: &Session, path: &Path) -> Result<()> {
         .create_new(true)
         .open(path)
         .with_context(|| format!("failed to create export {}", path.display()))?;
-    file.write_all(markdown(session).as_bytes())
+    file.write_all(format_markdown(session)?.as_bytes())
         .with_context(|| format!("failed to write export {}", path.display()))?;
     Ok(())
 }
 
-fn markdown(session: &Session) -> String {
-    format!(
+fn format_markdown(session: &Session) -> Result<String> {
+    let turns = transcript_turns(session)?;
+    let mut markdown = format!(
         "# {title}\n\n\
 - **Agent:** {agent}\n\
 - **Session id:** {id}\n\
 - **Cwd:** {cwd}\n\
 - **Branch:** {branch}\n\
 - **Started:** {started}\n\
-- **Last activity:** {last_activity}\n\
 - **Source file:** {source_file}\n\n\
 ---\n\n\
-## Conversation\n\n\
-### You\n\
-{first_user_prompt}\n\n\
-### Assistant (most recent)\n\
-{last_assistant_text}\n\n\
-{EXPORT_NOTE}\n",
+## Conversation\n\n",
         title = session_title(session),
         agent = agent_name(&session.agent),
         id = session.id,
@@ -71,11 +63,44 @@ fn markdown(session: &Session) -> String {
             .unwrap_or_else(|| "none".to_owned()),
         branch = session.git_branch.as_deref().unwrap_or("none"),
         started = format_ts(session.started_at),
-        last_activity = format_ts(last_activity(session)),
         source_file = display_path(&session.path).to_string_lossy(),
-        first_user_prompt = session.first_user_prompt.as_deref().unwrap_or(""),
-        last_assistant_text = session.last_assistant_text.as_deref().unwrap_or(""),
-    )
+    );
+
+    for turn in turns {
+        markdown.push_str(&format!(
+            "### {speaker} — {timestamp}\n\n{body}\n\n",
+            speaker = speaker_name(&turn.role),
+            timestamp = format_optional_ts(turn.timestamp),
+            body = format_turn_body(&turn.text),
+        ));
+    }
+
+    Ok(markdown)
+}
+
+fn transcript_turns(session: &Session) -> Result<Vec<TranscriptTurn>> {
+    match &session.agent {
+        Agent::Claude => ClaudeParser::extract_transcript(&session.path),
+        Agent::Codex => CodexParser::extract_transcript(&session.path),
+    }
+}
+
+fn speaker_name(role: &TranscriptRole) -> &'static str {
+    match role {
+        TranscriptRole::User => "You",
+        TranscriptRole::Assistant => "Assistant",
+    }
+}
+
+fn format_turn_body(text: &str) -> String {
+    if text.trim().is_empty() {
+        return "*(empty)*".to_owned();
+    }
+    if text.contains("```") {
+        format!("````\n{text}\n````")
+    } else {
+        text.to_owned()
+    }
 }
 
 fn disambiguated_export_path(session: &Session, dest_dir: &Path) -> PathBuf {
@@ -122,15 +147,6 @@ fn session_title(session: &Session) -> String {
         .to_owned()
 }
 
-fn last_activity(session: &Session) -> DateTime<Utc> {
-    match (session.last_user_msg_at, session.last_assistant_msg_at) {
-        (Some(user), Some(assistant)) => user.max(assistant),
-        (Some(user), None) => user,
-        (None, Some(assistant)) => assistant,
-        (None, None) => session.started_at,
-    }
-}
-
 fn display_path(path: &Path) -> PathBuf {
     if path.is_absolute() {
         return path.to_path_buf();
@@ -142,6 +158,10 @@ fn display_path(path: &Path) -> PathBuf {
 
 fn format_ts(timestamp: DateTime<Utc>) -> String {
     timestamp.to_rfc3339_opts(SecondsFormat::AutoSi, true)
+}
+
+fn format_optional_ts(timestamp: Option<DateTime<Utc>>) -> String {
+    timestamp.map(format_ts).unwrap_or_else(|| "?".to_owned())
 }
 
 fn id_short(id: &str) -> String {

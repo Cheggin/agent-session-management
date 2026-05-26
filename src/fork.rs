@@ -130,8 +130,12 @@ fn stream_fork_with_count(
     roots: &ForkRoots,
 ) -> Result<(ForkResult, usize)> {
     match agent {
-        Agent::Claude => write_claude_fork_streaming(source_path, cut_index, current_cwd, &roots.claude),
-        Agent::Codex => write_codex_fork_streaming(source_path, cut_index, current_cwd, &roots.codex),
+        Agent::Claude => {
+            write_claude_fork_streaming(source_path, cut_index, current_cwd, &roots.claude)
+        }
+        Agent::Codex => {
+            write_codex_fork_streaming(source_path, cut_index, current_cwd, &roots.codex)
+        }
     }
 }
 
@@ -236,7 +240,6 @@ fn write_claude_fork_streaming(
     }
 
     finalize_fork(
-        &Agent::Claude,
         lines_written,
         cut_index,
         first_user_turn,
@@ -354,7 +357,6 @@ fn write_codex_fork_streaming(
     }
 
     finalize_fork(
-        &Agent::Codex,
         lines_written,
         cut_index,
         first_user_turn,
@@ -373,7 +375,6 @@ fn write_codex_fork_streaming(
 }
 
 fn finalize_fork(
-    _agent: &Agent,
     lines_written: usize,
     cut_index: usize,
     first_user_turn: Option<usize>,

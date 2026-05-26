@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use serde_json::value::RawValue;
 
-use crate::{Agent, Entrypoint, Parser, Session};
+use crate::{Agent, Entrypoint, Parser, Session, TranscriptRole, TranscriptTurn};
 
 const READ_BUF_CAP: usize = 128 * 1024;
 
@@ -60,9 +60,9 @@ impl ClaudeParser {
 
         loop {
             line_buf.clear();
-            let n = reader
-                .read_line(&mut line_buf)
-                .with_context(|| format!("failed to read Claude session line from {}", path.display()))?;
+            let n = reader.read_line(&mut line_buf).with_context(|| {
+                format!("failed to read Claude session line from {}", path.display())
+            })?;
             if n == 0 {
                 break;
             }
@@ -95,6 +95,62 @@ impl ClaudeParser {
         }
 
         Ok(bodies)
+    }
+
+    pub fn extract_transcript(path: &Path) -> Result<Vec<TranscriptTurn>> {
+        let file = File::open(path)
+            .with_context(|| format!("failed to open Claude session {}", path.display()))?;
+        let mut reader = BufReader::with_capacity(READ_BUF_CAP, file);
+        let mut turns = Vec::new();
+        let mut line_buf = String::new();
+
+        loop {
+            line_buf.clear();
+            let n = reader.read_line(&mut line_buf).with_context(|| {
+                format!("failed to read Claude session line from {}", path.display())
+            })?;
+            if n == 0 {
+                break;
+            }
+            let trimmed = line_buf.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let Ok(event) = serde_json::from_str::<ClaudeEvent<'_>>(trimmed) else {
+                continue;
+            };
+            let timestamp = parse_timestamp_str(event.timestamp.as_deref());
+
+            match event.event_type.as_deref() {
+                Some("user") if !event.is_meta => {
+                    if let Some(message) = event.message {
+                        turns.extend(
+                            user_text_bodies(message)
+                                .into_iter()
+                                .filter(|text| !is_system_noise(text))
+                                .map(|text| TranscriptTurn {
+                                    role: TranscriptRole::User,
+                                    timestamp,
+                                    text,
+                                }),
+                        );
+                    }
+                }
+                Some("assistant") => {
+                    if let Some(message) = event.message.and_then(last_assistant_text) {
+                        turns.push(TranscriptTurn {
+                            role: TranscriptRole::Assistant,
+                            timestamp,
+                            text: message,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(turns)
     }
 }
 
@@ -129,9 +185,9 @@ impl Parser for ClaudeParser {
 
         loop {
             line_buf.clear();
-            let n = reader
-                .read_line(&mut line_buf)
-                .with_context(|| format!("failed to read Claude session line from {}", path.display()))?;
+            let n = reader.read_line(&mut line_buf).with_context(|| {
+                format!("failed to read Claude session line from {}", path.display())
+            })?;
             if n == 0 {
                 break;
             }
@@ -155,9 +211,7 @@ impl Parser for ClaudeParser {
                 cwd = Some(PathBuf::from(c));
             }
 
-            if !saw_git_branch
-                && let Some(branch) = event.git_branch.as_deref()
-            {
+            if !saw_git_branch && let Some(branch) = event.git_branch.as_deref() {
                 saw_git_branch = true;
                 if branch != "HEAD" {
                     git_branch = Some(branch.to_owned());
@@ -341,4 +395,3 @@ fn remember_recent_user_prompt(recent_user_prompts: &mut Vec<String>, prompt: St
         recent_user_prompts.remove(0);
     }
 }
-

@@ -30,7 +30,7 @@ use tracing::{info, info_span, warn};
 
 use crate::{
     Session, db::Index, export::export_session, fork::fork_session, reindex::reindex_all,
-    resume::dispatch_resume,
+    resume::dispatch_resume, update_check,
 };
 
 pub use app::App;
@@ -192,6 +192,7 @@ fn run_event_loop(
                 "first frame drawn"
             );
             start_live_session_scan(app);
+            start_update_check(app);
             if let Some(deferred) = deferred_reindex.take() {
                 background_reindex = Some(start_background_reindex(deferred));
             }
@@ -218,6 +219,10 @@ fn run_event_loop(
         }
 
         if poll_live_session_scan(app) {
+            needs_redraw = true;
+        }
+
+        if poll_update_check(app) {
             needs_redraw = true;
         }
 
@@ -427,6 +432,35 @@ fn poll_live_session_scan(app: &mut App) -> bool {
             warn!("background liveness worker disconnected");
             false
         }
+    }
+}
+
+fn start_update_check(app: &mut App) {
+    app.update_rx = update_check::spawn_check();
+}
+
+fn poll_update_check(app: &mut App) -> bool {
+    let Some(receiver) = app.update_rx.take() else {
+        return false;
+    };
+
+    match receiver.try_recv() {
+        Ok(update) => {
+            app.show_toast_for(
+                format!(
+                    "update available: v{} \u{2014} {}",
+                    update.latest,
+                    update_check::update_command_hint()
+                ),
+                Duration::from_secs(15),
+            );
+            true
+        }
+        Err(mpsc::TryRecvError::Empty) => {
+            app.update_rx = Some(receiver);
+            false
+        }
+        Err(mpsc::TryRecvError::Disconnected) => false,
     }
 }
 

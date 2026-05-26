@@ -37,6 +37,7 @@ pub struct App {
     pushdown_filter_dirty: bool,
     toast: Option<Toast>,
     pub(crate) live_rx: Option<Receiver<HashSet<String>>>,
+    pub(crate) update_rx: Option<Receiver<crate::update_check::AvailableUpdate>>,
 }
 
 #[derive(Debug)]
@@ -102,6 +103,7 @@ impl App {
             pushdown_filter_dirty: false,
             toast: None,
             live_rx: None,
+            update_rx: None,
         };
         app.refresh_filters();
         app
@@ -272,9 +274,13 @@ impl App {
     }
 
     pub fn show_toast(&mut self, message: impl Into<String>) {
+        self.show_toast_for(message, StdDuration::from_secs(3));
+    }
+
+    pub fn show_toast_for(&mut self, message: impl Into<String>, duration: StdDuration) {
         self.toast = Some(Toast {
             message: message.into(),
-            until: Instant::now() + StdDuration::from_secs(3),
+            until: Instant::now() + duration,
         });
     }
 

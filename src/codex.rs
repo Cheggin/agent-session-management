@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
-use crate::{Agent, Entrypoint, Parser, Session};
+use crate::{Agent, Entrypoint, Parser, Session, TranscriptRole, TranscriptTurn};
 
 const READ_BUF_CAP: usize = 128 * 1024;
 
@@ -116,6 +116,70 @@ impl CodexParser {
 
         Ok(bodies)
     }
+
+    pub fn extract_transcript(path: &Path) -> Result<Vec<TranscriptTurn>> {
+        let file = File::open(path)
+            .with_context(|| format!("failed to open Codex session {}", path.display()))?;
+        let mut reader = BufReader::with_capacity(READ_BUF_CAP, file);
+        let mut turns = Vec::new();
+        let mut line_buf = String::new();
+
+        loop {
+            line_buf.clear();
+            let n = reader.read_line(&mut line_buf).with_context(|| {
+                format!("failed to read Codex session line from {}", path.display())
+            })?;
+            if n == 0 {
+                break;
+            }
+            let trimmed = line_buf.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let Ok(event) = serde_json::from_str::<CodexEvent<'_>>(trimmed) else {
+                continue;
+            };
+            if event.event_type.as_deref() != Some("event_msg") {
+                continue;
+            }
+
+            let timestamp = parse_timestamp_str(event.timestamp.as_deref());
+            let Some(payload_raw) = event.payload else {
+                continue;
+            };
+            let Ok(payload) = serde_json::from_str::<CodexEventPayload<'_>>(payload_raw.get())
+            else {
+                continue;
+            };
+
+            match payload.payload_type.as_deref() {
+                Some("user_message") => {
+                    if let Some(message) = payload.message.as_deref().and_then(nonempty_trimmed)
+                        && !is_system_noise(&message)
+                    {
+                        turns.push(TranscriptTurn {
+                            role: TranscriptRole::User,
+                            timestamp,
+                            text: message,
+                        });
+                    }
+                }
+                Some("agent_message") => {
+                    if let Some(message) = payload.message.as_deref().and_then(nonempty_trimmed) {
+                        turns.push(TranscriptTurn {
+                            role: TranscriptRole::Assistant,
+                            timestamp,
+                            text: message,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(turns)
+    }
 }
 
 impl Parser for CodexParser {
@@ -127,43 +191,53 @@ impl Parser for CodexParser {
 
         // Locate the first parseable event; it must be session_meta.
         let meta_text = read_session_meta_line(&mut reader, &mut line_buf, path)?;
-        let meta_event: CodexEvent<'_> = serde_json::from_str(&meta_text)
-            .with_context(|| format!("Codex session {} session_meta is malformed", path.display()))?;
+        let meta_event: CodexEvent<'_> = serde_json::from_str(&meta_text).with_context(|| {
+            format!("Codex session {} session_meta is malformed", path.display())
+        })?;
         if meta_event.event_type.as_deref() != Some("session_meta") {
             bail!(
                 "Codex session {} first parseable event is not session_meta",
                 path.display()
             );
         }
-        let payload_raw = meta_event
-            .payload
-            .with_context(|| format!("Codex session {} session_meta has no payload", path.display()))?;
+        let payload_raw = meta_event.payload.with_context(|| {
+            format!(
+                "Codex session {} session_meta has no payload",
+                path.display()
+            )
+        })?;
         let meta_payload: CodexSessionMetaPayload<'_> = serde_json::from_str(payload_raw.get())
             .with_context(|| {
-                format!("Codex session {} session_meta payload is malformed", path.display())
+                format!(
+                    "Codex session {} session_meta payload is malformed",
+                    path.display()
+                )
             })?;
 
         let id = meta_payload
             .id
             .as_deref()
-            .with_context(|| format!("Codex session {} session_meta payload has no id", path.display()))?
+            .with_context(|| {
+                format!(
+                    "Codex session {} session_meta payload has no id",
+                    path.display()
+                )
+            })?
             .to_owned();
-        let started_at = parse_timestamp_str(meta_payload.timestamp.as_deref()).with_context(|| {
-            format!(
-                "Codex session {} has no parseable payload timestamp",
-                path.display()
-            )
-        })?;
+        let started_at =
+            parse_timestamp_str(meta_payload.timestamp.as_deref()).with_context(|| {
+                format!(
+                    "Codex session {} has no parseable payload timestamp",
+                    path.display()
+                )
+            })?;
         let cwd = meta_payload.cwd.as_deref().map(PathBuf::from);
         let git_branch = meta_payload
             .git
             .as_ref()
             .and_then(|git| git.branch.as_deref())
             .map(str::to_owned);
-        let entrypoint = meta_payload
-            .originator
-            .as_deref()
-            .map(parse_entrypoint);
+        let entrypoint = meta_payload.originator.as_deref().map(parse_entrypoint);
         let is_sidechain = meta_payload
             .thread_source
             .as_deref()
@@ -312,6 +386,20 @@ fn update_latest(latest: &mut Option<DateTime<Utc>>, timestamp: DateTime<Utc>) {
 fn nonempty_trimmed(text: &str) -> Option<String> {
     let text = text.trim();
     (!text.is_empty()).then(|| text.to_owned())
+}
+
+fn is_system_noise(text: &str) -> bool {
+    let t = text.trim_start();
+    t.starts_with("<task-notification>")
+        || t.starts_with("<system-reminder>")
+        || t.starts_with("<command-name>")
+        || t.starts_with("<command-message>")
+        || t.starts_with("<command-args>")
+        || t.starts_with("<local-command-stdout>")
+        || t.starts_with("<local-command-stderr>")
+        || t.starts_with("<bash-input>")
+        || t.starts_with("<bash-stdout>")
+        || t.starts_with("<bash-stderr>")
 }
 
 fn remember_recent_user_prompt(recent_user_prompts: &mut Vec<String>, prompt: String) {

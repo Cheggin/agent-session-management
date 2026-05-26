@@ -294,18 +294,11 @@ fn run_bench_resume(id: &str, repeat: usize) -> Result<()> {
         let argv = resume_command(&session);
         let elapsed = t.elapsed().as_micros();
         argv_times.push(elapsed);
-        eprintln!(
-            "  iter {}: argv_build={}us argv={:?}",
-            i + 1,
-            elapsed,
-            argv
-        );
+        eprintln!("  iter {}: argv_build={}us argv={:?}", i + 1, elapsed, argv);
     }
 
     print_stats("argv_build   ", &argv_times);
-    eprintln!(
-        "bench-resume: NOTE the actual exec(2) call is a single syscall (~10us);"
-    );
+    eprintln!("bench-resume: NOTE the actual exec(2) call is a single syscall (~10us);");
     eprintln!("              perceived latency is dominated by claude/codex startup.");
     Ok(())
 }

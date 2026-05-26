@@ -16,9 +16,23 @@ pub mod reindex;
 pub mod resume;
 pub mod shell;
 pub mod ui;
+pub mod update_check;
 
 pub use claude::ClaudeParser;
 pub use codex::CodexParser;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptTurn {
+    pub role: TranscriptRole,
+    pub timestamp: Option<DateTime<Utc>>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscriptRole {
+    User,
+    Assistant,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Agent {
