@@ -1,6 +1,5 @@
 use std::{
     collections::HashSet,
-    ffi::OsStr,
     path::{Path, PathBuf},
 };
 
@@ -104,34 +103,79 @@ fn has_recent_user_message(session: &Session, now: chrono::DateTime<Utc>) -> boo
 }
 
 fn is_agent_process(process: &Process) -> bool {
-    is_agent_name(process.name())
-        || process
-            .cmd()
-            .iter()
-            .take(3)
-            .filter_map(|arg| Path::new(arg).file_name())
-            .any(is_agent_name)
+    let process_name = process.name().to_string_lossy();
+    let argv = process_argv(process);
+    is_agent_invocation(&process_name, &argv)
 }
 
 fn resume_session_id(process: &Process) -> Option<String> {
-    let argv: Vec<_> = process
+    let argv = process_argv(process);
+    resume_session_id_from_argv(&argv)
+}
+
+fn process_argv(process: &Process) -> Vec<String> {
+    process
         .cmd()
         .iter()
-        .map(|arg| arg.to_string_lossy())
-        .collect();
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect()
+}
 
+#[doc(hidden)]
+pub fn is_agent_invocation<S>(process_name: &str, argv: &[S]) -> bool
+where
+    S: AsRef<str>,
+{
+    is_agent_name(process_name) || argv.iter().any(|arg| is_agent_arg(arg.as_ref()))
+}
+
+#[doc(hidden)]
+pub fn resume_session_id_from_argv<S>(argv: &[S]) -> Option<String>
+where
+    S: AsRef<str>,
+{
     for window in argv.windows(2) {
-        if matches!(window[0].as_ref(), "--resume" | "resume") && is_uuid_shape(&window[1]) {
-            return Some(window[1].to_string());
+        let flag = window[0].as_ref();
+        let value = window[1].as_ref();
+        if matches!(flag, "--resume" | "resume") && is_uuid_shape(value) {
+            return Some(value.to_string());
         }
     }
 
     None
 }
 
-fn is_agent_name(value: &OsStr) -> bool {
-    matches!(value.to_str(), Some("claude" | "codex"))
+fn is_agent_arg(value: &str) -> bool {
+    AGENT_PATH_MARKERS
+        .iter()
+        .any(|marker| value.contains(marker))
+        || Path::new(value)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(strip_node_script_suffix)
+            .is_some_and(is_agent_name)
 }
+
+fn strip_node_script_suffix(value: &str) -> &str {
+    for suffix in [".js", ".mjs", ".cjs"] {
+        if let Some(stripped) = value.strip_suffix(suffix) {
+            return stripped;
+        }
+    }
+
+    value
+}
+
+fn is_agent_name(value: &str) -> bool {
+    matches!(value, "claude" | "codex")
+}
+
+const AGENT_PATH_MARKERS: &[&str] = &[
+    "@openai/codex/bin/",
+    "@anthropic-ai/claude-code/",
+    "/claude-code/bin/",
+    "/codex/bin/",
+];
 
 fn is_uuid_shape(value: &str) -> bool {
     Uuid::parse_str(value).is_ok()
