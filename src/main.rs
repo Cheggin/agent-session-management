@@ -16,7 +16,7 @@ use asm::{
     fork::{ForkRoots, end_cut_index, fork_session, fork_session_timed},
     reindex::reindex_all,
     resume::{dispatch_resume, resume_command},
-    shell::{install_zsh, print_install_report, print_uninstall_report, uninstall_zsh},
+    shell::{install_shell, print_install_report, print_uninstall_report, uninstall_shell},
     ui::{self, filter::Chip},
 };
 use clap::{Parser as ClapParser, Subcommand};
@@ -42,9 +42,9 @@ struct Cli {
 enum Command {
     /// Build or refresh the SQLite session index.
     Reindex,
-    /// Install zsh shell hooks for claude --resume and codex resume.
+    /// Install shell hooks for claude --resume and codex resume.
     Install,
-    /// Uninstall zsh shell hooks.
+    /// Uninstall shell hooks.
     Uninstall,
     /// Interactive list view.
     Ls {
@@ -141,12 +141,12 @@ fn main() -> Result<()> {
         }
         Some(Command::Install) => {
             reject_filter_for_non_list(cli.filter.as_deref());
-            let report = install_zsh()?;
+            let report = install_shell()?;
             print_install_report(&report);
         }
         Some(Command::Uninstall) => {
             reject_filter_for_non_list(cli.filter.as_deref());
-            let report = uninstall_zsh()?;
+            let report = uninstall_shell()?;
             print_uninstall_report(&report);
         }
         Some(Command::Ls { filter, global }) => {

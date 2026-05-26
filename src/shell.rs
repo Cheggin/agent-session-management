@@ -22,85 +22,172 @@ codex() {
 }
 "#;
 
-const ZSHRC_MARKER: &str = "# asm shell hooks (installed by `asm install`)";
-const ZSHRC_PATH_LINE: &str =
+const SH_HOOK_CONTENT: &str = r#"# Managed by  — do not edit by hand.
+claude() {
+  for arg in "$@"; do
+    if [ "$arg" = "--resume" ]; then
+      exec asm --filter claude
+    fi
+  done
+  command claude "$@"
+}
+codex() {
+  if [ "${1:-}" = "resume" ]; then
+    exec asm --filter codex
+  fi
+  command codex "$@"
+}
+"#;
+
+const RCFILE_MARKER: &str = "# asm shell hooks (installed by `asm install`)";
+const ZSH_BASH_PATH_LINE: &str =
     "[[ \":$PATH:\" != *\":$HOME/.cargo/bin:\"* ]] && export PATH=\"$HOME/.cargo/bin:$PATH\"";
-const ZSHRC_SOURCE_LINE: &str = "[[ -f ~/.asm/shell-hooks.zsh ]] && source ~/.asm/shell-hooks.zsh";
+const SH_PATH_LINE: &str = "case \":$PATH:\" in *\":$HOME/.cargo/bin:\"*) ;; *) export PATH=\"$HOME/.cargo/bin:$PATH\";; esac";
+const ZSH_SOURCE_LINE: &str = "[[ -f ~/.asm/shell-hooks.zsh ]] && source ~/.asm/shell-hooks.zsh";
+const BASH_SOURCE_LINE: &str = "[[ -f ~/.asm/shell-hooks.bash ]] && source ~/.asm/shell-hooks.bash";
+const SH_SOURCE_LINE: &str = "[ -f ~/.asm/shell-hooks.sh ] && . ~/.asm/shell-hooks.sh";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellKind {
+    Zsh,
+    Bash,
+    Sh,
+}
+
+impl ShellKind {
+    fn from_shell_path(shell: &str) -> Option<Self> {
+        match Path::new(shell).file_name().and_then(|name| name.to_str()) {
+            Some("zsh") => Some(Self::Zsh),
+            Some("bash") => Some(Self::Bash),
+            Some("sh") => Some(Self::Sh),
+            _ => None,
+        }
+    }
+
+    fn hook_file(self) -> &'static str {
+        match self {
+            Self::Zsh => "shell-hooks.zsh",
+            Self::Bash => "shell-hooks.bash",
+            Self::Sh => "shell-hooks.sh",
+        }
+    }
+
+    fn hook_content(self) -> &'static str {
+        match self {
+            Self::Zsh | Self::Bash => HOOK_CONTENT,
+            Self::Sh => SH_HOOK_CONTENT,
+        }
+    }
+
+    fn rcfile(self) -> &'static str {
+        match self {
+            Self::Zsh => ".zshrc",
+            Self::Bash => ".bashrc",
+            Self::Sh => ".profile",
+        }
+    }
+
+    fn path_line(self) -> &'static str {
+        match self {
+            Self::Zsh | Self::Bash => ZSH_BASH_PATH_LINE,
+            Self::Sh => SH_PATH_LINE,
+        }
+    }
+
+    fn source_line(self) -> &'static str {
+        match self {
+            Self::Zsh => ZSH_SOURCE_LINE,
+            Self::Bash => BASH_SOURCE_LINE,
+            Self::Sh => SH_SOURCE_LINE,
+        }
+    }
+
+    fn reload_command(self) -> &'static str {
+        match self {
+            Self::Zsh => "source ~/.zshrc",
+            Self::Bash => "source ~/.bashrc",
+            Self::Sh => ". ~/.profile",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallReport {
+    pub shell: ShellKind,
     pub hook_path: PathBuf,
-    pub zshrc_path: PathBuf,
+    pub rcfile_path: PathBuf,
     pub wrote_hook: bool,
     pub appended_source_line: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UninstallReport {
+    pub shell: ShellKind,
     pub hook_path: PathBuf,
-    pub zshrc_path: PathBuf,
+    pub rcfile_path: PathBuf,
     pub removed_source_line: bool,
     pub deleted_hook: bool,
 }
 
-pub fn install_zsh() -> Result<InstallReport> {
-    ensure_zsh_shell_or_exit();
+pub fn install_shell() -> Result<InstallReport> {
+    let shell = detect_shell_or_exit();
     let home = dirs::home_dir().context("could not determine home directory")?;
-    install_zsh_at(&home)
+    install_shell_at(&home, shell)
 }
 
-pub fn uninstall_zsh() -> Result<UninstallReport> {
-    ensure_zsh_shell_or_exit();
+pub fn uninstall_shell() -> Result<UninstallReport> {
+    let shell = detect_shell_or_exit();
     let home = dirs::home_dir().context("could not determine home directory")?;
-    uninstall_zsh_at(&home)
+    uninstall_shell_at(&home, shell)
 }
 
-pub fn install_zsh_at(home_dir: &Path) -> Result<InstallReport> {
+pub fn install_shell_at(home_dir: &Path, shell: ShellKind) -> Result<InstallReport> {
     let asm_dir = home_dir.join(".asm");
     fs::create_dir_all(&asm_dir)
         .with_context(|| format!("failed to create {}", asm_dir.display()))?;
 
-    let hook_path = asm_dir.join("shell-hooks.zsh");
-    fs::write(&hook_path, HOOK_CONTENT)
+    let hook_path = asm_dir.join(shell.hook_file());
+    fs::write(&hook_path, shell.hook_content())
         .with_context(|| format!("failed to write {}", hook_path.display()))?;
 
-    let zshrc_path = home_dir.join(".zshrc");
-    let mut zshrc = read_optional_to_string(&zshrc_path)?;
-    let appended_block = !has_marker(&zshrc);
+    let rcfile_path = home_dir.join(shell.rcfile());
+    let mut rcfile = read_optional_to_string(&rcfile_path)?;
+    let appended_block = !has_marker(&rcfile);
     if appended_block {
-        if !zshrc.is_empty() && !zshrc.ends_with('\n') {
-            zshrc.push('\n');
+        if !rcfile.is_empty() && !rcfile.ends_with('\n') {
+            rcfile.push('\n');
         }
-        zshrc.push_str(ZSHRC_MARKER);
-        zshrc.push('\n');
-        zshrc.push_str(ZSHRC_PATH_LINE);
-        zshrc.push('\n');
-        zshrc.push_str(ZSHRC_SOURCE_LINE);
-        zshrc.push('\n');
-        fs::write(&zshrc_path, zshrc)
-            .with_context(|| format!("failed to write {}", zshrc_path.display()))?;
+        rcfile.push_str(RCFILE_MARKER);
+        rcfile.push('\n');
+        rcfile.push_str(shell.path_line());
+        rcfile.push('\n');
+        rcfile.push_str(shell.source_line());
+        rcfile.push('\n');
+        fs::write(&rcfile_path, rcfile)
+            .with_context(|| format!("failed to write {}", rcfile_path.display()))?;
     }
 
     Ok(InstallReport {
+        shell,
         hook_path,
-        zshrc_path,
+        rcfile_path,
         wrote_hook: true,
         appended_source_line: appended_block,
     })
 }
 
-pub fn uninstall_zsh_at(home_dir: &Path) -> Result<UninstallReport> {
-    let hook_path = home_dir.join(".asm").join("shell-hooks.zsh");
-    let zshrc_path = home_dir.join(".zshrc");
+pub fn uninstall_shell_at(home_dir: &Path, shell: ShellKind) -> Result<UninstallReport> {
+    let hook_path = home_dir.join(".asm").join(shell.hook_file());
+    let rcfile_path = home_dir.join(shell.rcfile());
 
     let mut removed_source_line = false;
-    if zshrc_path.exists() {
-        let zshrc = fs::read_to_string(&zshrc_path)
-            .with_context(|| format!("failed to read {}", zshrc_path.display()))?;
-        let filtered = remove_managed_zshrc_lines(&zshrc, &mut removed_source_line);
-        if filtered != zshrc {
-            fs::write(&zshrc_path, filtered)
-                .with_context(|| format!("failed to write {}", zshrc_path.display()))?;
+    if rcfile_path.exists() {
+        let rcfile = fs::read_to_string(&rcfile_path)
+            .with_context(|| format!("failed to read {}", rcfile_path.display()))?;
+        let filtered = remove_managed_rcfile_lines(&rcfile, shell, &mut removed_source_line);
+        if filtered != rcfile {
+            fs::write(&rcfile_path, filtered)
+                .with_context(|| format!("failed to write {}", rcfile_path.display()))?;
         }
     }
 
@@ -113,8 +200,9 @@ pub fn uninstall_zsh_at(home_dir: &Path) -> Result<UninstallReport> {
     };
 
     Ok(UninstallReport {
+        shell,
         hook_path,
-        zshrc_path,
+        rcfile_path,
         removed_source_line,
         deleted_hook,
     })
@@ -122,34 +210,46 @@ pub fn uninstall_zsh_at(home_dir: &Path) -> Result<UninstallReport> {
 
 pub fn print_install_report(report: &InstallReport) {
     if report.wrote_hook {
-        println!("wrote ~/.asm/shell-hooks.zsh");
+        println!("wrote ~/.asm/{}", report.shell.hook_file());
     }
     if report.appended_source_line {
-        println!("appended managed block to ~/.zshrc (PATH + source line)");
+        println!(
+            "appended managed block to ~/{} (PATH + source line)",
+            report.shell.rcfile()
+        );
     } else {
-        println!("managed block already present in ~/.zshrc");
+        println!(
+            "managed block already present in ~/{}",
+            report.shell.rcfile()
+        );
     }
-    println!("restart your shell or run: source ~/.zshrc");
+    println!(
+        "restart your shell or run: {}",
+        report.shell.reload_command()
+    );
 }
 
 pub fn print_uninstall_report(report: &UninstallReport) {
     if report.removed_source_line {
-        println!("removed source line from ~/.zshrc");
+        println!("removed source line from ~/{}", report.shell.rcfile());
     } else {
-        println!("source line not present in ~/.zshrc");
+        println!("source line not present in ~/{}", report.shell.rcfile());
     }
     if report.deleted_hook {
-        println!("deleted ~/.asm/shell-hooks.zsh");
+        println!("deleted ~/.asm/{}", report.shell.hook_file());
     } else {
-        println!("~/.asm/shell-hooks.zsh already absent");
+        println!("~/.asm/{} already absent", report.shell.hook_file());
     }
 }
 
-fn ensure_zsh_shell_or_exit() {
+fn detect_shell_or_exit() -> ShellKind {
     let shell = env::var("SHELL").unwrap_or_else(|_| "<unset>".to_owned());
-    if Path::new(&shell).file_name().and_then(|name| name.to_str()) != Some("zsh") {
-        eprintln!("asm install currently supports zsh only; your shell is {shell}");
-        std::process::exit(1);
+    match ShellKind::from_shell_path(&shell) {
+        Some(kind) => kind,
+        None => {
+            eprintln!("asm install currently supports zsh, bash, and sh; your shell is {shell}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -161,24 +261,30 @@ fn read_optional_to_string(path: &Path) -> Result<String> {
     }
 }
 
-fn has_marker(zshrc: &str) -> bool {
-    zshrc.lines().any(|line| line.trim() == ZSHRC_MARKER)
+fn has_marker(rcfile: &str) -> bool {
+    rcfile.lines().any(|line| line.trim() == RCFILE_MARKER)
 }
 
-fn remove_managed_zshrc_lines(zshrc: &str, removed_source_line: &mut bool) -> String {
+fn remove_managed_rcfile_lines(
+    rcfile: &str,
+    shell: ShellKind,
+    removed_source_line: &mut bool,
+) -> String {
     let mut kept = Vec::new();
-    for line in zshrc.lines() {
-        match line.trim() {
-            ZSHRC_MARKER | ZSHRC_PATH_LINE => {}
-            ZSHRC_SOURCE_LINE => {
-                *removed_source_line = true;
-            }
-            _ => kept.push(line),
+    for line in rcfile.lines() {
+        let trimmed = line.trim();
+        if trimmed == RCFILE_MARKER || trimmed == shell.path_line() {
+            continue;
         }
+        if trimmed == shell.source_line() {
+            *removed_source_line = true;
+            continue;
+        }
+        kept.push(line);
     }
 
     let mut out = kept.join("\n");
-    if zshrc.ends_with('\n') && !out.is_empty() {
+    if rcfile.ends_with('\n') && !out.is_empty() {
         out.push('\n');
     }
     out
