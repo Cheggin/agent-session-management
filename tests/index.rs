@@ -74,3 +74,19 @@ fn sqlite_index_tracks_last_reindex_age() {
 
     assert!(index.last_reindex_age().unwrap().unwrap().as_secs() < 5);
 }
+
+#[test]
+fn sqlite_index_stores_message_bodies_for_dump_search_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut index = Index::open_in_dir(temp.path()).unwrap();
+    let path = fixture("tests/fixtures/claude/b0fd6a29-a517-4325-a68a-fd7c1fbba04b.jsonl");
+    let session = ClaudeParser::parse(&path).unwrap();
+    let bodies = ClaudeParser::extract_message_bodies(&path).unwrap();
+
+    index.upsert_session(&session, 1, &bodies).unwrap();
+
+    let bodies_by_session = index.dump_message_bodies().unwrap();
+    let stored_body = bodies_by_session.get(&session.id).unwrap();
+    assert!(!stored_body.trim().is_empty());
+    assert!(stored_body.contains("github"));
+}

@@ -11,11 +11,12 @@
 //! round-trips while still preserving the requested schema text.
 //! `path_mtime` is stored separately as a Unix nanosecond integer for
 //! incremental reindex checks.
-//! `is_live` is not present in the Step 4 schema because liveness is a later
-//! process-scan concern; rows loaded from this index reconstruct it as `false`.
+//! `is_live`/`maybe_live` are not present in the Step 4 schema because liveness
+//! is a later process-scan concern; rows loaded from this index reconstruct both
+//! as `false`.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -231,23 +232,6 @@ impl Index {
         }
         tx.commit()?;
         Ok(())
-    }
-
-    pub fn fts_match(&self, pattern: &str) -> Result<HashSet<String>> {
-        let pattern = pattern.trim();
-        if pattern.is_empty() {
-            return Ok(HashSet::new());
-        }
-
-        let mut stmt = self
-            .conn
-            .prepare("SELECT DISTINCT session_id FROM messages_fts WHERE messages_fts MATCH ?1")?;
-        let rows = stmt.query_map(params![pattern], |row| row.get::<_, String>(0))?;
-        let mut matches = HashSet::new();
-        for row in rows {
-            matches.insert(row?);
-        }
-        Ok(matches)
     }
 
     pub fn dump_message_bodies(&self) -> Result<HashMap<String, String>> {
@@ -541,6 +525,7 @@ fn session_from_row(row: &Row<'_>) -> Result<Session> {
             format!("invalid user_msg_count {user_msg_count_raw} for session {id}")
         })?,
         is_live: false,
+        maybe_live: false,
         is_sidechain: is_sidechain_raw != 0,
     })
 }
