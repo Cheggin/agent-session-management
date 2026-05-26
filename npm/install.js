@@ -80,10 +80,14 @@ async function downloadAndExtract(target, destBin) {
   }
 }
 
+// Returns a short tag describing the outcome:
+//   'installed' — hook written, user needs to source zshrc
+//   'skipped'   — non-zsh or explicit opt-out
+//   'failed'    — tried and failed
 function maybeInstallShellHook(asmBin) {
   if (process.env.ASM_SKIP_SHELL_HOOK === '1') {
     process.stdout.write('@reaganhsu/asm: ASM_SKIP_SHELL_HOOK=1, skipping shell hook setup\n');
-    return;
+    return 'skipped';
   }
   const shell = process.env.SHELL || '';
   if (!shell.endsWith('/zsh') && shell !== 'zsh') {
@@ -91,16 +95,64 @@ function maybeInstallShellHook(asmBin) {
       `@reaganhsu/asm: shell is ${shell || 'unknown'}, not zsh — skipping hook. ` +
       `Re-run 'asm install' manually if you switch to zsh.\n`
     );
-    return;
+    return 'skipped';
   }
   try {
     execSync(`${JSON.stringify(asmBin)} install`, { stdio: 'inherit' });
+    return 'installed';
   } catch (err) {
     process.stderr.write(
       `@reaganhsu/asm: 'asm install' failed (${err.message}); ` +
       `run it manually to enable claude --resume / codex resume proxying.\n`
     );
+    return 'failed';
   }
+}
+
+function printWelcome(hookStatus) {
+  const lines = [
+    '',
+    `  asm v${VERSION} installed.`,
+    '',
+    '  asm is a TUI for fuzzy-searching and resuming Claude Code / Codex sessions.',
+    '',
+    '  Try it now:',
+    '    asm                 picker scoped to the current directory',
+    '    asm --global        every session across every directory',
+    '    asm ls --filter "claude branch:main"',
+    '',
+    '  Inside the picker:',
+    '    Enter        resume the highlighted session',
+    '    ctrl-f       fork at a chosen turn',
+    '    ctrl-e       export to markdown',
+    '    @tag         filter chips (agent, branch, repo, ...)',
+    '    esc / ^C     quit',
+    '',
+  ];
+  if (hookStatus === 'installed') {
+    lines.push(
+      '  Shell hook is wired up. Open a new terminal (or `source ~/.zshrc`) and then',
+      '  bare `claude --resume` / `codex resume` will open asm instead.',
+      ''
+    );
+  } else if (hookStatus === 'skipped') {
+    lines.push(
+      '  Shell hook NOT installed (non-zsh or opted out). Run `asm install` later',
+      "  to wire bare `claude --resume` / `codex resume` through asm.",
+      ''
+    );
+  } else {
+    lines.push(
+      '  Shell hook setup failed — run `asm install` manually to retry.',
+      ''
+    );
+  }
+  lines.push(
+    '  Docs:    https://github.com/Cheggin/agent-session-management',
+    '  Update:  npm update -g @reaganhsu/asm',
+    ''
+  );
+  process.stdout.write(lines.join('\n'));
 }
 
 async function main() {
@@ -112,7 +164,8 @@ async function main() {
   const destBin = path.join(__dirname, 'bin', 'asm');
   await downloadAndExtract(target, destBin);
   process.stdout.write(`@reaganhsu/asm: installed ${destBin}\n`);
-  maybeInstallShellHook(destBin);
+  const hookStatus = maybeInstallShellHook(destBin);
+  printWelcome(hookStatus);
 }
 
 main().catch((err) => {
