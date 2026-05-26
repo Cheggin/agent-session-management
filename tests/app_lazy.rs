@@ -21,6 +21,7 @@ fn app_loads_message_body_haystacks_lazily_for_search() {
         last_assistant_msg_at: None,
         user_msg_count: 1,
         is_live: false,
+        maybe_live: false,
         is_sidechain: false,
     };
     let mut app = App::new(vec![session], Path::new("/tmp").to_path_buf());

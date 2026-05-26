@@ -297,6 +297,7 @@ impl Parser for ClaudeParser {
             last_assistant_msg_at,
             user_msg_count,
             is_live: false,
+            maybe_live: false,
             is_sidechain,
         })
     }

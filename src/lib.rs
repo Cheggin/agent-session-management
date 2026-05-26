@@ -79,6 +79,8 @@ pub struct Session {
 
     // status
     pub is_live: bool,
+    #[serde(default, skip)]
+    pub maybe_live: bool,
     pub is_sidechain: bool,
 }
 

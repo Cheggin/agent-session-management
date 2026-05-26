@@ -137,6 +137,7 @@ mod tests {
             last_assistant_msg_at: None,
             user_msg_count: 0,
             is_live: false,
+            maybe_live: false,
             is_sidechain: false,
         }
     }

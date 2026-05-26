@@ -108,6 +108,7 @@ fn session(id: &str, agent: Agent, cwd: &str, branch: &str, entrypoint: Entrypoi
         last_assistant_msg_at: None,
         user_msg_count: 1,
         is_live: false,
+        maybe_live: false,
         is_sidechain: false,
     }
 }

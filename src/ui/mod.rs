@@ -8,7 +8,6 @@ mod sparkline;
 mod theme;
 
 use std::{
-    collections::HashSet,
     io::{self, IsTerminal, Stdout},
     path::{Path, PathBuf},
     sync::mpsc,
@@ -29,8 +28,8 @@ use ratatui::{
 use tracing::{info, info_span, warn};
 
 use crate::{
-    Session, db::Index, export::export_session, fork::fork_session, reindex::reindex_all,
-    resume::dispatch_resume, update_check,
+    Session, db::Index, export::export_session, fork::fork_session, liveness::LivenessSnapshot,
+    reindex::reindex_all, resume::dispatch_resume, update_check,
 };
 
 pub use app::App;
@@ -55,7 +54,7 @@ struct BackgroundReindexComplete {
 }
 
 type BackgroundReindexReceiver = mpsc::Receiver<BackgroundReindexComplete>;
-type LiveSessionReceiver = mpsc::Receiver<HashSet<String>>;
+type LiveSessionReceiver = mpsc::Receiver<LivenessSnapshot>;
 
 enum StartupReindex {
     Complete(Option<crate::reindex::ReindexStats>),
@@ -406,10 +405,11 @@ fn start_background_reindex(deferred: DeferredReindex) -> BackgroundReindexRecei
 }
 
 fn start_live_session_scan(app: &mut App) {
-    let (sender, receiver): (mpsc::Sender<HashSet<String>>, LiveSessionReceiver) = mpsc::channel();
+    let (sender, receiver): (mpsc::Sender<LivenessSnapshot>, LiveSessionReceiver) = mpsc::channel();
+    let sessions = app.sessions.clone();
     app.live_rx = Some(receiver);
     std::thread::spawn(move || {
-        let live_ids = crate::liveness::live_session_ids();
+        let live_ids = crate::liveness::live_session_ids(&sessions);
         let _ = sender.send(live_ids);
     });
 }

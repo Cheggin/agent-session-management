@@ -68,6 +68,10 @@ pub fn live() -> Style {
     Style::default().fg(green()).add_modifier(Modifier::BOLD)
 }
 
+pub fn live_maybe() -> Style {
+    Style::default().fg(green()).add_modifier(Modifier::DIM)
+}
+
 pub fn branch() -> Style {
     Style::default().fg(mauve())
 }

@@ -237,7 +237,9 @@ fn list_row(session: &Session, width: usize) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             format!("{live} "),
-            if session.is_live {
+            if session.maybe_live {
+                theme::live_maybe()
+            } else if session.is_live {
                 theme::live()
             } else {
                 theme::dim()

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, mpsc::Receiver},
     time::{Duration as StdDuration, Instant},
@@ -8,7 +8,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::{Session, reindex::ReindexStats};
+use crate::{Session, liveness::LivenessSnapshot, reindex::ReindexStats};
 
 use super::{
     composer::Composer,
@@ -36,7 +36,7 @@ pub struct App {
     live_chips: Vec<Chip>,
     pushdown_filter_dirty: bool,
     toast: Option<Toast>,
-    pub(crate) live_rx: Option<Receiver<HashSet<String>>>,
+    pub(crate) live_rx: Option<Receiver<LivenessSnapshot>>,
     pub(crate) update_rx: Option<Receiver<crate::update_check::AvailableUpdate>>,
 }
 
@@ -302,9 +302,12 @@ impl App {
         self.filtered_indices.len()
     }
 
-    pub(crate) fn apply_live_session_ids(&mut self, live_ids: &HashSet<String>) {
+    pub(crate) fn apply_live_session_ids(&mut self, snapshot: &LivenessSnapshot) {
         for session in &mut self.sessions {
-            session.is_live = live_ids.contains(&session.id);
+            let confirmed = snapshot.confirmed.contains(&session.id);
+            let maybe = snapshot.maybe.contains(&session.id);
+            session.is_live = confirmed || maybe;
+            session.maybe_live = maybe && !confirmed;
         }
         self.refresh_filters();
     }
@@ -475,5 +478,6 @@ fn normalize_search_text(input: &str) -> String {
 fn clear_live_sessions(sessions: &mut [Session]) {
     for session in sessions {
         session.is_live = false;
+        session.maybe_live = false;
     }
 }

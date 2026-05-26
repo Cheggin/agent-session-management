@@ -67,6 +67,7 @@ fn assert_session(session: Session, expected: ExpectedSession) {
     );
     assert_eq!(session.user_msg_count, expected.user_msg_count);
     assert_eq!(session.is_live, expected.is_live);
+    assert!(!session.maybe_live);
     assert_eq!(session.is_sidechain, expected.is_sidechain);
 }
 

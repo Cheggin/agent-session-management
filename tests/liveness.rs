@@ -6,14 +6,22 @@ use uuid::Uuid;
 
 #[test]
 fn live_session_ids_returns_confirmed_resume_ids_without_panicking() {
-    let live_ids = live_session_ids();
+    let snapshot = live_session_ids(&[]);
     let possible_ids = currently_running_agent_resume_ids();
 
-    assert!(live_ids.iter().all(|id| Uuid::parse_str(id).is_ok()));
     assert!(
-        live_ids.is_subset(&possible_ids),
-        "live ids {live_ids:?} should be a subset of running claude/codex resume ids {possible_ids:?}"
+        snapshot
+            .confirmed
+            .iter()
+            .all(|id| Uuid::parse_str(id).is_ok())
     );
+    assert!(
+        snapshot.confirmed.is_subset(&possible_ids),
+        "live ids {:?} should be a subset of running claude/codex resume ids {possible_ids:?}",
+        snapshot.confirmed
+    );
+    assert!(snapshot.maybe.is_empty());
+    assert!(snapshot.confirmed.is_disjoint(&snapshot.maybe));
 }
 
 fn currently_running_agent_resume_ids() -> HashSet<String> {
